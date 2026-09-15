@@ -1,0 +1,15 @@
+# build output
+build/
+cmake-build-*/
+*.o
+*.obj
+*.exe
+*.out
+*.dSYM/
+# engine data/log files produced by tests
+*.db
+*.wal
+# editor/OS
+.DS_Store
+.vscode/
+.idea/
