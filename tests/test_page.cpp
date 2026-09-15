@@ -78,3 +78,94 @@ FLINTDB_TEST(page_fills_up_and_then_refuses_further_inserts) {
     size_t upper_bound = (PAGE_SIZE - Page::kHeaderSize) / (100 + Page::kSlotSize) + 1;
     FLINTDB_CHECK(static_cast<size_t>(inserted) <= upper_bound);
 }
+
+FLINTDB_TEST(page_fresh_slot_is_not_deleted) {
+    Page page;
+    page.InitHeapPage(0);
+    auto slot = page.InsertRecord("hello");
+    FLINTDB_CHECK(slot.has_value());
+    FLINTDB_CHECK(!page.IsDeleted(*slot));
+}
+
+FLINTDB_TEST(page_delete_record_marks_it_deleted_without_shrinking_slot_count) {
+    Page page;
+    page.InitHeapPage(0);
+    auto slot = page.InsertRecord("hello");
+    FLINTDB_CHECK(slot.has_value());
+    uint16_t before = page.GetSlotCount();
+
+    page.DeleteRecord(*slot);
+
+    FLINTDB_CHECK(page.IsDeleted(*slot));
+    FLINTDB_CHECK_EQ(page.GetSlotCount(), before);  // slot ids are never reclaimed
+}
+
+FLINTDB_TEST(page_deleted_slot_get_record_still_returns_original_bytes) {
+    Page page;
+    page.InitHeapPage(0);
+    auto slot = page.InsertRecord("still-here");
+    FLINTDB_CHECK(slot.has_value());
+
+    page.DeleteRecord(*slot);
+
+    // Nothing wipes the physical bytes on delete -- GetRecord must still
+    // mask off the tombstone bit correctly and return exactly what was
+    // written, not garbage or a truncated/corrupted length.
+    FLINTDB_CHECK_EQ(page.GetRecord(*slot), std::string("still-here"));
+}
+
+FLINTDB_TEST(page_multiple_slots_can_be_tombstoned_independently) {
+    Page page;
+    page.InitHeapPage(0);
+    auto s0 = page.InsertRecord("row-0");
+    auto s1 = page.InsertRecord("row-1");
+    auto s2 = page.InsertRecord("row-2");
+    FLINTDB_CHECK(s0.has_value());
+    FLINTDB_CHECK(s1.has_value());
+    FLINTDB_CHECK(s2.has_value());
+
+    page.DeleteRecord(*s1);
+
+    FLINTDB_CHECK(!page.IsDeleted(*s0));
+    FLINTDB_CHECK(page.IsDeleted(*s1));
+    FLINTDB_CHECK(!page.IsDeleted(*s2));
+    FLINTDB_CHECK_EQ(page.GetRecord(*s0), std::string("row-0"));
+    FLINTDB_CHECK_EQ(page.GetRecord(*s2), std::string("row-2"));
+
+    // Deleting a second, unrelated slot must not disturb the first.
+    page.DeleteRecord(*s2);
+    FLINTDB_CHECK(page.IsDeleted(*s1));
+    FLINTDB_CHECK(page.IsDeleted(*s2));
+    FLINTDB_CHECK(!page.IsDeleted(*s0));
+}
+
+FLINTDB_TEST(page_delete_record_does_not_change_free_space) {
+    // Tombstoning is purely a metadata flip -- it must not reclaim or
+    // otherwise touch pd_lower/pd_upper. Space reclamation (compaction) is
+    // explicitly out of scope (see page.h's class comment).
+    Page page;
+    page.InitHeapPage(0);
+    auto slot = page.InsertRecord("hello");
+    FLINTDB_CHECK(slot.has_value());
+    size_t free_before = page.FreeSpace();
+
+    page.DeleteRecord(*slot);
+
+    FLINTDB_CHECK_EQ(page.FreeSpace(), free_before);
+}
+
+FLINTDB_TEST(page_insert_after_delete_still_gets_a_fresh_slot_id) {
+    // Confirms deletion never reuses slot ids -- the next insert continues
+    // the same monotonically increasing sequence.
+    Page page;
+    page.InitHeapPage(0);
+    auto s0 = page.InsertRecord("row-0");
+    FLINTDB_CHECK(s0.has_value());
+    page.DeleteRecord(*s0);
+
+    auto s1 = page.InsertRecord("row-1");
+    FLINTDB_CHECK(s1.has_value());
+    FLINTDB_CHECK_EQ(*s1, 1u);
+    FLINTDB_CHECK(page.IsDeleted(*s0));
+    FLINTDB_CHECK(!page.IsDeleted(*s1));
+}

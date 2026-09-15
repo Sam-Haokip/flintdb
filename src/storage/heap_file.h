@@ -39,19 +39,17 @@ class HeapFile {
     // rather than a strawman.
     std::optional<RID> Find(const std::function<bool(const std::string&)>& pred) const;
 
-    // Deletes the row at `rid` by rewriting the *entire* heap file without
-    // it: every surviving row is re-inserted into a freshly truncated
-    // file. Returns false (no-op) if `rid` doesn't currently name a live
-    // row.
+    // Deletes the row at `rid` by tombstoning its slot in place (see
+    // Page::DeleteRecord) — no file rewrite, no RID reassignment. Returns
+    // false (no-op) if `rid` doesn't currently name a live row (unknown
+    // page, out-of-range slot, or already-deleted slot).
     //
-    // This is deliberately the simplest possible correct implementation —
-    // "delete-by-rewrite" is this phase's whole point, per the project
-    // brief: no free-list, no in-place reclamation. The real cost is that
-    // it reassigns RIDs for every remaining row. That's harmless today
-    // (nothing else references a RID across a Delete call yet), but it
-    // will need to change once Phase 2's B-tree starts storing RIDs as
-    // index entries — logged as an open question in docs/SPEC.md and a
-    // decision to revisit in docs/DECISIONS.md.
+    // This replaced the original Phase 1 "delete-by-rewrite" strategy —
+    // see docs/DECISIONS.md D-015 for why: a whole-file rewrite reassigns
+    // every surviving row's RID, which both Phase 2's B-tree (RIDs stored
+    // as index entries) and Phase 3's page-level WAL redo logging (a
+    // "this page becomes this" record can't express "the file just got
+    // shorter and everything was renumbered") need to not happen.
     bool Delete(RID rid);
 
     size_t NumRows() const;

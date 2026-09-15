@@ -9,7 +9,8 @@ Page* BufferPool::NewPage(PageId* out_page_id) {
     auto page = std::make_unique<Page>();  // std::array default-inits to all zero
     Page* raw = page.get();
     pages_[pid] = std::move(page);
-    dirty_.insert(pid);
+    MarkDirty(pid);  // routes through MarkDirty (not a direct dirty_.insert) so the
+                      // active-transaction observer, if any, sees new pages too
     if (out_page_id) *out_page_id = pid;
     return raw;
 }
@@ -33,7 +34,10 @@ Page* BufferPool::FetchPage(PageId page_id) {
     return raw;
 }
 
-void BufferPool::MarkDirty(PageId page_id) { dirty_.insert(page_id); }
+void BufferPool::MarkDirty(PageId page_id) {
+    dirty_.insert(page_id);
+    if (active_txn_observer_) active_txn_observer_(page_id);
+}
 
 void BufferPool::FlushAll() {
     for (PageId pid : dirty_) {
@@ -52,6 +56,19 @@ void BufferPool::ResetAll() {
     pages_.clear();
     dirty_.clear();
     disk_manager_->ResetFile();
+}
+
+void BufferPool::SetActiveTransactionObserver(std::function<void(PageId)> observer) {
+    active_txn_observer_ = std::move(observer);
+}
+
+void BufferPool::ClearActiveTransactionObserver() { active_txn_observer_ = nullptr; }
+
+void BufferPool::DiscardPage(PageId page_id) {
+    auto it = pages_.find(page_id);
+    if (it == pages_.end()) return;  // never cached -- nothing to discard
+    disk_manager_->ReadPage(page_id, it->second->Data());
+    dirty_.erase(page_id);
 }
 
 }  // namespace flintdb

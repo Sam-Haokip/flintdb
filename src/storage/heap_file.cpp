@@ -1,5 +1,6 @@
 #include "heap_file.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace flintdb {
@@ -49,6 +50,7 @@ std::vector<std::pair<RID, std::string>> HeapFile::Scan() const {
         Page* page = buffer_pool_->FetchPage(pid);
         uint16_t n = page->GetSlotCount();
         for (SlotId s = 0; s < n; s++) {
+            if (page->IsDeleted(s)) continue;
             out.emplace_back(RID{pid, s}, page->GetRecord(s));
         }
     }
@@ -62,6 +64,7 @@ std::optional<RID> HeapFile::Find(const std::function<bool(const std::string&)>&
         Page* page = buffer_pool_->FetchPage(pid);
         uint16_t n = page->GetSlotCount();
         for (SlotId s = 0; s < n; s++) {
+            if (page->IsDeleted(s)) continue;
             std::string record = page->GetRecord(s);
             if (pred(record)) return RID{pid, s};
         }
@@ -70,26 +73,15 @@ std::optional<RID> HeapFile::Find(const std::function<bool(const std::string&)>&
 }
 
 bool HeapFile::Delete(RID rid) {
-    auto rows = Scan();
-
-    bool found = false;
-    std::vector<std::string> remaining;
-    remaining.reserve(rows.size());
-    for (auto& [r, bytes] : rows) {
-        if (!found && r == rid) {
-            found = true;
-            continue;
-        }
-        remaining.push_back(std::move(bytes));
+    if (std::find(page_ids_.begin(), page_ids_.end(), rid.page_id) == page_ids_.end()) {
+        return false;  // not a page this heap file owns
     }
-    if (!found) return false;
-
-    buffer_pool_->ResetAll();
-    page_ids_.clear();
-
-    for (auto& bytes : remaining) {
-        Insert(bytes);
+    Page* page = buffer_pool_->FetchPage(rid.page_id);
+    if (rid.slot_id >= page->GetSlotCount() || page->IsDeleted(rid.slot_id)) {
+        return false;
     }
+    page->DeleteRecord(rid.slot_id);
+    buffer_pool_->MarkDirty(rid.page_id);
     return true;
 }
 

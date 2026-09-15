@@ -108,33 +108,60 @@ FLINTDB_TEST(heap_file_delete_across_many_rows_leaves_exactly_the_survivors) {
     BufferPool bp(&dm);
     HeapFile heap(&bp);
 
+    // Delete is now tombstone-in-place (D-015): a RID captured before any
+    // Delete call stays valid for every later one, unlike the original
+    // Phase 1 delete-by-rewrite this replaced. So every RID can simply be
+    // cached up front, exactly as a real caller holding onto RIDs (e.g. a
+    // B-tree index entry) would expect.
+    std::vector<RID> rids;
     for (int i = 0; i < 10; i++) {
-        heap.Insert("row-" + std::to_string(i));
+        rids.push_back(heap.Insert("row-" + std::to_string(i)));
     }
 
-    // HeapFile::Delete rewrites the whole file and reassigns RIDs for every
-    // surviving row on each call (documented in heap_file.h /
-    // docs/DECISIONS.md) — a RID captured before an earlier Delete is stale
-    // by the time a later Delete runs. So each target's RID has to be
-    // looked up fresh, right before it's deleted, exactly as a real caller
-    // would have to.
-    auto find_rid_by_content = [&](const std::string& content) -> RID {
-        for (auto& [rid, bytes] : heap.Scan()) {
-            if (bytes == content) return rid;
-        }
-        throw std::runtime_error("row not found: " + content);
-    };
-
-    // Delete every even-indexed row.
+    // Delete every even-indexed row using the RIDs captured at insert time.
     for (int i = 0; i < 10; i += 2) {
-        std::string target = "row-" + std::to_string(i);
-        FLINTDB_CHECK(heap.Delete(find_rid_by_content(target)));
+        FLINTDB_CHECK(heap.Delete(rids[static_cast<size_t>(i)]));
     }
 
     auto rows = heap.Scan();
     FLINTDB_CHECK_EQ(rows.size(), 5u);
     std::multiset<std::string> expected = {"row-1", "row-3", "row-5", "row-7", "row-9"};
     FLINTDB_CHECK(RowContents(rows) == expected);
+}
+
+FLINTDB_TEST(heap_file_delete_is_tombstone_in_place_rid_stays_stable) {
+    TempFile tmp;
+    DiskManager dm(tmp.path());
+    BufferPool bp(&dm);
+    HeapFile heap(&bp);
+
+    RID r0 = heap.Insert("row-0");
+    RID r1 = heap.Insert("row-1");
+    RID r2 = heap.Insert("row-2");
+
+    FLINTDB_CHECK(heap.Delete(r1));
+
+    // r0 and r2 must still resolve to exactly their original content —
+    // nothing was renumbered.
+    auto rows = heap.Scan();
+    FLINTDB_CHECK_EQ(rows.size(), 2u);
+    for (auto& [rid, bytes] : rows) {
+        if (rid == r0) FLINTDB_CHECK_EQ(bytes, std::string("row-0"));
+        else if (rid == r2) FLINTDB_CHECK_EQ(bytes, std::string("row-2"));
+        else FLINTDB_CHECK(false);  // no other RID should appear
+    }
+}
+
+FLINTDB_TEST(heap_file_delete_of_already_deleted_rid_is_a_no_op) {
+    TempFile tmp;
+    DiskManager dm(tmp.path());
+    BufferPool bp(&dm);
+    HeapFile heap(&bp);
+
+    RID r0 = heap.Insert("only-row");
+    FLINTDB_CHECK(heap.Delete(r0));
+    FLINTDB_CHECK(!heap.Delete(r0));  // second delete of the same RID fails
+    FLINTDB_CHECK_EQ(heap.NumRows(), 0u);
 }
 
 FLINTDB_TEST(heap_file_persists_across_reopen_via_a_new_buffer_pool) {

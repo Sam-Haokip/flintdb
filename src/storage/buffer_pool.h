@@ -2,6 +2,7 @@
 #include "disk_manager.h"
 #include "page.h"
 
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -14,6 +15,11 @@ namespace flintdb {
 // get the storage layer correct and tested before optimizing it — a real
 // eviction policy (clock/LRU) is future work once a workload actually
 // shows memory pressure, not before.
+//
+// No eviction also means every Page* this class ever hands out (via
+// NewPage/NewHeapPage/FetchPage) stays valid for the BufferPool's whole
+// lifetime — DiscardPage below leans on exactly this to revert a page's
+// content in place without invalidating anyone else's pointer to it.
 class BufferPool {
  public:
     explicit BufferPool(DiskManager* disk_manager);
@@ -49,10 +55,39 @@ class BufferPool {
     // HeapFile's Phase-1 delete-by-rewrite (see docs/DECISIONS.md).
     void ResetAll();
 
+    // Registers `observer` to be called with a page's id every time
+    // MarkDirty runs for it (including indirectly, via NewPage/
+    // NewHeapPage) while it's set. This is how TransactionManager
+    // (src/txn) finds out which pages a transaction touched without
+    // BufferPool needing to know Transaction/TransactionManager exist —
+    // avoids a circular dependency between storage/ and txn/.
+    //
+    // Exactly one observer can be active at a time, which is all Phase 3
+    // needs (only one transaction is ever active — see
+    // txn/transaction_manager.h). Multiple concurrent transactions
+    // (Phase 4) will need this to become a real registry keyed by which
+    // transaction dirtied which page, not a single global callback.
+    void SetActiveTransactionObserver(std::function<void(PageId)> observer);
+    void ClearActiveTransactionObserver();
+
+    // Reloads `page_id`'s in-memory content from disk, discarding
+    // whatever was cached, and clears its dirty flag. Used by
+    // Transaction::Abort (txn/transaction_manager.h) to revert a page's
+    // in-memory state back to what's durably on disk. A no-op if
+    // `page_id` was never cached in the first place.
+    //
+    // Reloads in place rather than dropping and re-fetching the cache
+    // entry, so any Page* another caller is holding for this page_id
+    // stays valid and simply reflects the reverted content on its next
+    // access — required given no-eviction's stable-pointer guarantee
+    // above.
+    void DiscardPage(PageId page_id);
+
  private:
     DiskManager* disk_manager_;
     std::unordered_map<PageId, std::unique_ptr<Page>> pages_;
     std::unordered_set<PageId> dirty_;
+    std::function<void(PageId)> active_txn_observer_;
 };
 
 }  // namespace flintdb

@@ -17,6 +17,9 @@ add_library(flintdb_core STATIC
   src/storage/buffer_pool.cpp
   src/storage/heap_file.cpp
   src/index/btree.cpp
+  src/wal/log_manager.cpp
+  src/wal/recovery.cpp
+  src/txn/transaction_manager.cpp
 )
 target_include_directories(flintdb_core PUBLIC src)
 
@@ -27,6 +30,10 @@ add_executable(flintdb_tests
   tests/test_buffer_pool.cpp
   tests/test_heap_file.cpp
   tests/test_btree.cpp
+  tests/test_log_manager.cpp
+  tests/test_recovery.cpp
+  tests/test_transaction.cpp
+  tests/test_crash_recovery.cpp
 )
 target_link_libraries(flintdb_tests PRIVATE flintdb_core)
 target_include_directories(flintdb_tests PRIVATE tests)

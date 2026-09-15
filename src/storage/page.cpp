@@ -34,6 +34,13 @@ void WriteAt(char* buf, size_t offset, T v) {
     std::memcpy(buf + offset, &v, sizeof(T));
 }
 
+// The record-length field only ever needs to represent lengths up to
+// PAGE_SIZE (4096) in practice, leaving the top bit of the 16-bit field
+// permanently unused by any real record — repurposed here as a tombstone
+// flag rather than growing the slot entry (see D-015). GetRecord masks it
+// off so old callers reading a still-live slot see no change at all.
+constexpr uint16_t kDeletedFlag = 0x8000;
+
 }  // namespace
 
 Page::Page() = default;
@@ -74,7 +81,11 @@ void Page::SetSlotEntry(SlotId slot_id, SlotEntry entry) {
 }
 
 std::optional<SlotId> Page::InsertRecord(const std::string& data) {
-    if (data.size() > UINT16_MAX) return std::nullopt;
+    // Length must fit under kDeletedFlag, not just UINT16_MAX, now that the
+    // top bit is reserved (see kDeletedFlag's comment). Unreachable in
+    // practice anyway -- PAGE_SIZE is far smaller than kDeletedFlag -- but
+    // stated precisely rather than left as a stale UINT16_MAX check.
+    if (data.size() >= kDeletedFlag) return std::nullopt;
     uint16_t len = static_cast<uint16_t>(data.size());
 
     uint32_t pd_lower = GetPdLower();
@@ -102,7 +113,19 @@ std::optional<SlotId> Page::InsertRecord(const std::string& data) {
 std::string Page::GetRecord(SlotId slot_id) const {
     assert(slot_id < GetSlotCount());
     SlotEntry e = GetSlotEntry(slot_id);
-    return std::string(buf_.data() + e.offset, e.length);
+    return std::string(buf_.data() + e.offset, e.length & ~kDeletedFlag);
+}
+
+void Page::DeleteRecord(SlotId slot_id) {
+    assert(slot_id < GetSlotCount());
+    SlotEntry e = GetSlotEntry(slot_id);
+    e.length = static_cast<uint16_t>(e.length | kDeletedFlag);
+    SetSlotEntry(slot_id, e);
+}
+
+bool Page::IsDeleted(SlotId slot_id) const {
+    assert(slot_id < GetSlotCount());
+    return (GetSlotEntry(slot_id).length & kDeletedFlag) != 0;
 }
 
 char* Page::Data() { return buf_.data(); }
