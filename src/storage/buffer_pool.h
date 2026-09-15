@@ -18,9 +18,17 @@ class BufferPool {
  public:
     explicit BufferPool(DiskManager* disk_manager);
 
-    // Allocates a brand-new page via the DiskManager, initializes it as an
-    // empty heap page, caches it, and returns a pointer to the in-memory
-    // copy. Writes the new id to *out_page_id if non-null.
+    // Allocates a brand-new, zero-filled page via the DiskManager, caches
+    // it dirty, and returns a pointer to the in-memory copy. Writes the
+    // new id to *out_page_id if non-null. This is the primitive every
+    // page *kind* builds on: it knows nothing about slotted heap pages or
+    // B-tree nodes, just raw pages (see common/config.h's PageType for how
+    // a page then declares what it actually is).
+    Page* NewPage(PageId* out_page_id);
+
+    // Convenience wrapper: NewPage, then initialize it as an empty heap
+    // page. Kept separate from NewPage so non-heap page kinds (B-tree
+    // nodes, from Phase 2 on) don't have to fight HeapFile-specific setup.
     Page* NewHeapPage(PageId* out_page_id);
 
     // Returns the in-memory page for `page_id`, reading it from disk into

@@ -16,8 +16,6 @@ constexpr size_t kOffPdUpper = 10;    // uint16_t
 // corruption-fuzzing work — deliberately zeroed and unused for now rather
 // than designed blind).
 
-enum class PageType : uint16_t { kInvalid = 0, kHeap = 1 };
-
 // memcpy-based accessors rather than reinterpret_cast'ing buf_.data() to a
 // header struct pointer: the latter relies on the buffer having the right
 // alignment and on strict-aliasing not biting us, which is exactly the

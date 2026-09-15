@@ -2,6 +2,8 @@
 #include "../common/rid.h"
 #include "buffer_pool.h"
 
+#include <functional>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,6 +30,14 @@ class HeapFile {
     // Returns every live row as (RID, bytes) pairs. Order is page id then
     // slot id — not any particular logical order beyond that.
     std::vector<std::pair<RID, std::string>> Scan() const;
+
+    // Scans rows in order, calling `pred` on each, and returns the RID of
+    // the first row for which it returns true — stopping immediately,
+    // unlike Scan(), which always materializes every row. This is what a
+    // real sequential-scan WHERE-clause lookup does, and it's what Phase
+    // 2's scan-vs-index benchmark needs in order to be a fair comparison
+    // rather than a strawman.
+    std::optional<RID> Find(const std::function<bool(const std::string&)>& pred) const;
 
     // Deletes the row at `rid` by rewriting the *entire* heap file without
     // it: every surviving row is re-inserted into a freshly truncated

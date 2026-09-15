@@ -4,15 +4,22 @@ namespace flintdb {
 
 BufferPool::BufferPool(DiskManager* disk_manager) : disk_manager_(disk_manager) {}
 
-Page* BufferPool::NewHeapPage(PageId* out_page_id) {
+Page* BufferPool::NewPage(PageId* out_page_id) {
     PageId pid = disk_manager_->AllocatePage();
-    auto page = std::make_unique<Page>();
-    page->InitHeapPage(pid);
+    auto page = std::make_unique<Page>();  // std::array default-inits to all zero
     Page* raw = page.get();
     pages_[pid] = std::move(page);
     dirty_.insert(pid);
     if (out_page_id) *out_page_id = pid;
     return raw;
+}
+
+Page* BufferPool::NewHeapPage(PageId* out_page_id) {
+    PageId pid;
+    Page* page = NewPage(&pid);
+    page->InitHeapPage(pid);
+    if (out_page_id) *out_page_id = pid;
+    return page;
 }
 
 Page* BufferPool::FetchPage(PageId page_id) {

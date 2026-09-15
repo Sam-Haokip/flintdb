@@ -57,6 +57,18 @@ std::vector<std::pair<RID, std::string>> HeapFile::Scan() const {
 
 size_t HeapFile::NumRows() const { return Scan().size(); }
 
+std::optional<RID> HeapFile::Find(const std::function<bool(const std::string&)>& pred) const {
+    for (PageId pid : page_ids_) {
+        Page* page = buffer_pool_->FetchPage(pid);
+        uint16_t n = page->GetSlotCount();
+        for (SlotId s = 0; s < n; s++) {
+            std::string record = page->GetRecord(s);
+            if (pred(record)) return RID{pid, s};
+        }
+    }
+    return std::nullopt;
+}
+
 bool HeapFile::Delete(RID rid) {
     auto rows = Scan();
 
