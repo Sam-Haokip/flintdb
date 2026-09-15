@@ -3,6 +3,7 @@
 #include "buffer_pool.h"
 
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -18,6 +19,32 @@ namespace flintdb {
 //
 // See docs/SPEC.md for what this layer does and doesn't guarantee, and
 // docs/DECISIONS.md for why Delete works the way it does below.
+//
+// Thread-safe as of Phase 4, in the same two senses BPlusTree is (see
+// btree.h's class comment for the general pattern):
+//
+// 1. Memory safety: page_ids_mutex_ guards page_ids_ itself, plain
+//    shared mutable state outside of any page -- Insert can append to it
+//    (a new page) and Scan/Find/Delete/NumRows all read it, none of
+//    which is safe to do concurrently, unsynchronized, on a
+//    std::vector. Always held only briefly (a snapshot copy, or a single
+//    push_back/find), never across a BufferPool call or a LockManager
+//    lock acquisition that could block -- consistent with every other
+//    latch in this codebase never being held across a call that can
+//    wait on something else.
+//
+// 2. Transactional (isolation) correctness: every public method acquires
+//    a LockManager lock through GetCurrentTransaction()->AcquireLock (a
+//    no-op with no active transaction, preserving every pre-Phase-4
+//    caller's behavior exactly) for each page it touches -- shared for
+//    Scan/Find, exclusive for Insert/Delete. Unlike BPlusTree, HeapFile
+//    has no equivalent of a "root pointer" that a stale read could
+//    silently miscompute from: page_ids_ only ever grows (Insert appends,
+//    nothing ever removes a page from it), so a transaction that
+//    snapshots page_ids_ before a concurrent Insert appends a new page
+//    simply doesn't see that new page in *this* Scan/Find call, no
+//    different in kind from a transaction that committed a fraction of a
+//    second later under Strict 2PL -- not a correctness gap.
 class HeapFile {
  public:
     // If the buffer pool's underlying file already has pages (i.e. this is
@@ -57,6 +84,7 @@ class HeapFile {
  private:
     BufferPool* buffer_pool_;
     std::vector<PageId> page_ids_;
+    mutable std::mutex page_ids_mutex_;
 };
 
 }  // namespace flintdb

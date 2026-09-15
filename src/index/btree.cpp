@@ -1,5 +1,7 @@
 #include "btree.h"
 
+#include "../txn/transaction.h"
+
 #include <algorithm>
 #include <cstring>
 
@@ -42,6 +44,29 @@ void WriteAt(char* buf, size_t off, T v) {
 }
 
 PageType ReadPageType(const char* buf) { return static_cast<PageType>(ReadAt<uint16_t>(buf, kOffPageType)); }
+
+// A synthetic PageId, never actually allocated by DiskManager (real page
+// ids are handed out starting at 0 and only ever grow -- see
+// DiskManager::AllocatePage), reserved purely as a LockManager lock
+// target representing "this BPlusTree's root pointer" as a whole. See
+// btree.h's class comment for why root_page_id_ needs this in addition
+// to plain per-node locking. Distinct from INVALID_PAGE_ID (which means
+// "no page"/absence, e.g. a leaf with no next_leaf) -- this id is never
+// compared against a real page, only ever used as a LockManager key.
+constexpr PageId kRootLockSentinel = INVALID_PAGE_ID - 1;
+
+// Acquires `mode` on `page_id` through the calling thread's current
+// transaction, if any -- a no-op when GetCurrentTransaction() is
+// nullptr, which is what keeps every pre-Phase-4 non-transactional
+// caller (and every test that calls BPlusTree directly, with no
+// TransactionManager involved) working exactly as before, unlocked.
+void LockPage(PageId page_id, LockMode mode) {
+    if (Transaction* txn = GetCurrentTransaction()) txn->AcquireLock(page_id, mode);
+}
+
+// Shorthand for locking the synthetic root sentinel -- see its own
+// comment above and btree.h's class comment for what this protects.
+void LockRoot(LockMode mode) { LockPage(kRootLockSentinel, mode); }
 
 // Per-entry byte costs, used to compute how many keys fit in one page.
 constexpr size_t kLeafEntrySize = sizeof(int64_t) + sizeof(PageId) + sizeof(SlotId);        // 14
@@ -232,16 +257,35 @@ std::optional<size_t> FindRebalanceSplit(const std::vector<int64_t>& keys, size_
 
 BPlusTree::BPlusTree(BufferPool* buffer_pool) : buffer_pool_(buffer_pool) {}
 
-bool BPlusTree::Empty() const { return root_page_id_ == INVALID_PAGE_ID; }
+PageId BPlusTree::GetRootPageId() const {
+    std::lock_guard<std::mutex> lock(root_mutex_);
+    return root_page_id_;
+}
+
+void BPlusTree::SetRootPageId(PageId page_id) {
+    std::lock_guard<std::mutex> lock(root_mutex_);
+    root_page_id_ = page_id;
+}
+
+bool BPlusTree::Empty() const {
+    // A single-field read with no multi-step traversal to protect from a
+    // concurrent root change -- root_mutex_ alone (memory safety) is
+    // enough here, no need for the transactional sentinel lock too.
+    return GetRootPageId() == INVALID_PAGE_ID;
+}
 
 size_t BPlusTree::Height() const {
-    if (root_page_id_ == INVALID_PAGE_ID) return 0;
+    LockRoot(LockMode::kShared);
+    PageId root = GetRootPageId();
+    if (root == INVALID_PAGE_ID) return 0;
     size_t h = 1;
-    PageId cur = root_page_id_;
+    PageId cur = root;
+    LockPage(cur, LockMode::kShared);
     Page* page = buffer_pool_->FetchPage(cur);
     while (ReadPageType(page->Data()) != PageType::kBTreeLeaf) {
         InternalNode node = DeserializeInternal(page->Data());
         cur = node.children.front();
+        LockPage(cur, LockMode::kShared);
         page = buffer_pool_->FetchPage(cur);
         h++;
     }
@@ -250,10 +294,13 @@ size_t BPlusTree::Height() const {
 
 std::vector<RID> BPlusTree::Search(int64_t key) const {
     std::vector<RID> results;
-    if (root_page_id_ == INVALID_PAGE_ID) return results;
+    LockRoot(LockMode::kShared);
+    PageId root = GetRootPageId();
+    if (root == INVALID_PAGE_ID) return results;
 
-    PageId cur = root_page_id_;
+    PageId cur = root;
     while (true) {
+        LockPage(cur, LockMode::kShared);
         Page* page = buffer_pool_->FetchPage(cur);
         if (ReadPageType(page->Data()) == PageType::kBTreeLeaf) {
             LeafNode leaf = DeserializeLeaf(page->Data());
@@ -270,20 +317,27 @@ std::vector<RID> BPlusTree::Search(int64_t key) const {
 
 std::vector<std::pair<int64_t, RID>> BPlusTree::RangeScanAll() const {
     std::vector<std::pair<int64_t, RID>> out;
-    if (root_page_id_ == INVALID_PAGE_ID) return out;
+    LockRoot(LockMode::kShared);
+    PageId root = GetRootPageId();
+    if (root == INVALID_PAGE_ID) return out;
 
-    PageId cur = root_page_id_;
+    PageId cur = root;
+    LockPage(cur, LockMode::kShared);
     Page* page = buffer_pool_->FetchPage(cur);
     while (ReadPageType(page->Data()) != PageType::kBTreeLeaf) {
         InternalNode node = DeserializeInternal(page->Data());
         cur = node.children.front();
+        LockPage(cur, LockMode::kShared);
         page = buffer_pool_->FetchPage(cur);
     }
-    while (cur != INVALID_PAGE_ID) {
-        page = buffer_pool_->FetchPage(cur);
+    // `cur`/`page` are now the leftmost leaf, already locked and fetched.
+    while (true) {
         LeafNode leaf = DeserializeLeaf(page->Data());
         for (size_t i = 0; i < leaf.keys.size(); i++) out.emplace_back(leaf.keys[i], leaf.values[i]);
+        if (leaf.next_leaf == INVALID_PAGE_ID) break;
         cur = leaf.next_leaf;
+        LockPage(cur, LockMode::kShared);
+        page = buffer_pool_->FetchPage(cur);
     }
     return out;
 }
@@ -362,40 +416,54 @@ std::optional<std::string> ValidateSubtree(BufferPool* bp, PageId page_id, bool 
 }  // namespace
 
 std::optional<std::string> BPlusTree::ValidateInvariants() const {
-    if (root_page_id_ == INVALID_PAGE_ID) return std::nullopt;
-    return ValidateSubtree(buffer_pool_, root_page_id_, /*has_lower=*/false, 0, /*has_upper=*/false, 0);
+    // Deliberately GetRootPageId() (memory-safe) rather than the
+    // transactional LockRoot()+lock -- see the class comment: this is
+    // debug/test-only and not part of the transactional API surface.
+    PageId root = GetRootPageId();
+    if (root == INVALID_PAGE_ID) return std::nullopt;
+    return ValidateSubtree(buffer_pool_, root, /*has_lower=*/false, 0, /*has_upper=*/false, 0);
 }
 
 void BPlusTree::Insert(int64_t key, RID rid) {
-    if (root_page_id_ == INVALID_PAGE_ID) {
+    // Exclusive on the whole operation: Insert may replace root_page_id_
+    // (on a root split), so it needs the same protection a Delete-side
+    // root collapse does -- see btree.h's class comment on
+    // kRootLockSentinel.
+    LockRoot(LockMode::kExclusive);
+    PageId root = GetRootPageId();
+
+    if (root == INVALID_PAGE_ID) {
         PageId pid;
         Page* page = buffer_pool_->NewPage(&pid);
+        LockPage(pid, LockMode::kExclusive);  // bookkeeping only -- a brand-new page can't conflict with anyone
         LeafNode leaf;
         leaf.page_id = pid;
         leaf.keys.push_back(key);
         leaf.values.push_back(rid);
         SerializeLeaf(leaf, page->Data());
         buffer_pool_->MarkDirty(pid);
-        root_page_id_ = pid;
+        SetRootPageId(pid);
         return;
     }
 
-    auto split = InsertRecursive(root_page_id_, key, rid);
+    auto split = InsertRecursive(root, key, rid);
     if (split.has_value()) {
         PageId new_root_pid;
         Page* new_root_page = buffer_pool_->NewPage(&new_root_pid);
+        LockPage(new_root_pid, LockMode::kExclusive);
         InternalNode new_root;
         new_root.page_id = new_root_pid;
         new_root.keys.push_back(split->split_key);
-        new_root.children.push_back(root_page_id_);
+        new_root.children.push_back(root);
         new_root.children.push_back(split->new_right_page_id);
         SerializeInternal(new_root, new_root_page->Data());
         buffer_pool_->MarkDirty(new_root_pid);
-        root_page_id_ = new_root_pid;
+        SetRootPageId(new_root_pid);
     }
 }
 
 std::optional<BPlusTree::SplitResult> BPlusTree::InsertRecursive(PageId page_id, int64_t key, RID rid) {
+    LockPage(page_id, LockMode::kExclusive);
     Page* page = buffer_pool_->FetchPage(page_id);
 
     if (ReadPageType(page->Data()) == PageType::kBTreeLeaf) {
@@ -418,6 +486,7 @@ std::optional<BPlusTree::SplitResult> BPlusTree::InsertRecursive(PageId page_id,
         LeafNode right;
         PageId right_pid;
         Page* right_page = buffer_pool_->NewPage(&right_pid);
+        LockPage(right_pid, LockMode::kExclusive);  // bookkeeping only -- brand new
         right.page_id = right_pid;
         right.keys.assign(leaf.keys.begin() + static_cast<long>(mid), leaf.keys.end());
         right.values.assign(leaf.values.begin() + static_cast<long>(mid), leaf.values.end());
@@ -462,6 +531,7 @@ std::optional<BPlusTree::SplitResult> BPlusTree::InsertRecursive(PageId page_id,
     InternalNode right;
     PageId right_pid;
     Page* right_page = buffer_pool_->NewPage(&right_pid);
+    LockPage(right_pid, LockMode::kExclusive);  // bookkeeping only -- brand new
     right.page_id = right_pid;
     right.keys.assign(node.keys.begin() + static_cast<long>(mid) + 1, node.keys.end());
     right.children.assign(node.children.begin() + static_cast<long>(mid) + 1, node.children.end());
@@ -478,30 +548,37 @@ std::optional<BPlusTree::SplitResult> BPlusTree::InsertRecursive(PageId page_id,
 }
 
 bool BPlusTree::Delete(int64_t key, RID rid) {
-    if (root_page_id_ == INVALID_PAGE_ID) return false;
+    // Exclusive on the whole operation: Delete may replace root_page_id_
+    // on a root collapse -- see btree.h's class comment.
+    LockRoot(LockMode::kExclusive);
+    PageId root = GetRootPageId();
+    if (root == INVALID_PAGE_ID) return false;
 
-    DeleteResult result = DeleteRecursive(root_page_id_, /*is_root=*/true, key, rid);
+    DeleteResult result = DeleteRecursive(root, /*is_root=*/true, key, rid);
     if (!result.found) return false;
 
     // Root collapse: a leaf root can become empty, or an internal root
     // can be merged down to a single child, in either of which cases the
-    // tree shrinks by one level (or to nothing).
-    Page* root_page = buffer_pool_->FetchPage(root_page_id_);
+    // tree shrinks by one level (or to nothing). `root` is already
+    // exclusively locked (DeleteRecursive locked it on the way in), so
+    // no additional LockPage call is needed for this re-fetch.
+    Page* root_page = buffer_pool_->FetchPage(root);
     if (ReadPageType(root_page->Data()) == PageType::kBTreeLeaf) {
         LeafNode root_leaf = DeserializeLeaf(root_page->Data());
         if (root_leaf.keys.empty()) {
-            root_page_id_ = INVALID_PAGE_ID;
+            SetRootPageId(INVALID_PAGE_ID);
         }
     } else {
         InternalNode root_internal = DeserializeInternal(root_page->Data());
         if (root_internal.children.size() == 1) {
-            root_page_id_ = root_internal.children[0];
+            SetRootPageId(root_internal.children[0]);
         }
     }
     return true;
 }
 
 BPlusTree::DeleteResult BPlusTree::DeleteRecursive(PageId page_id, bool is_root, int64_t key, RID rid) {
+    LockPage(page_id, LockMode::kExclusive);
     Page* page = buffer_pool_->FetchPage(page_id);
 
     if (ReadPageType(page->Data()) == PageType::kBTreeLeaf) {
@@ -542,6 +619,11 @@ BPlusTree::DeleteResult BPlusTree::DeleteRecursive(PageId page_id, bool is_root,
 
 void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
     PageId child_pid = parent.children[idx];
+    // Already locked by the DeleteRecursive call that led here (this
+    // page id is exactly the one it just finished processing) -- calling
+    // LockPage again is a harmless no-op, kept for clarity that this
+    // function's own contract requires it regardless of caller.
+    LockPage(child_pid, LockMode::kExclusive);
     Page* child_page = buffer_pool_->FetchPage(child_pid);
     bool has_left = idx > 0;
     bool has_right = idx + 1 < parent.children.size();
@@ -566,6 +648,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
         // kLeafMinKeys). A non-root node always has at least one sibling,
         // so exactly one of the two blocks below runs.
         if (has_left) {
+            LockPage(parent.children[idx - 1], LockMode::kExclusive);
             Page* left_page = buffer_pool_->FetchPage(parent.children[idx - 1]);
             LeafNode left = DeserializeLeaf(left_page->Data());
             size_t combined_size = left.keys.size() + child.keys.size();
@@ -610,6 +693,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
             return;
         }
 
+        LockPage(parent.children[idx + 1], LockMode::kExclusive);
         Page* right_page = buffer_pool_->FetchPage(parent.children[idx + 1]);
         LeafNode right = DeserializeLeaf(right_page->Data());
         size_t combined_size = child.keys.size() + right.keys.size();
@@ -663,6 +747,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
     InternalNode child = DeserializeInternal(child_page->Data());
 
     if (has_left) {
+        LockPage(parent.children[idx - 1], LockMode::kExclusive);
         Page* left_page = buffer_pool_->FetchPage(parent.children[idx - 1]);
         InternalNode left = DeserializeInternal(left_page->Data());
         if (left.keys.size() > kInternalMinKeys) {
@@ -682,6 +767,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
         }
     }
     if (has_right) {
+        LockPage(parent.children[idx + 1], LockMode::kExclusive);
         Page* right_page = buffer_pool_->FetchPage(parent.children[idx + 1]);
         InternalNode right = DeserializeInternal(right_page->Data());
         if (right.keys.size() > kInternalMinKeys) {
@@ -708,6 +794,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
     // get here when neither sibling had spare capacity to redistribute
     // from, so combined size <= 2*kInternalMinKeys < kInternalMaxKeys.
     if (has_left) {
+        LockPage(parent.children[idx - 1], LockMode::kExclusive);
         Page* left_page = buffer_pool_->FetchPage(parent.children[idx - 1]);
         InternalNode left = DeserializeInternal(left_page->Data());
         left.keys.push_back(parent.keys[idx - 1]);
@@ -718,6 +805,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
         parent.keys.erase(parent.keys.begin() + static_cast<long>(idx) - 1);
         parent.children.erase(parent.children.begin() + static_cast<long>(idx));
     } else {
+        LockPage(parent.children[idx + 1], LockMode::kExclusive);
         Page* right_page = buffer_pool_->FetchPage(parent.children[idx + 1]);
         InternalNode right = DeserializeInternal(right_page->Data());
         child.keys.push_back(parent.keys[idx]);

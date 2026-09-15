@@ -2,6 +2,7 @@
 #include "../common/config.h"
 #include "log_record.h"
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -32,8 +33,23 @@ namespace flintdb {
 // LogManager tell a genuine record apart from a torn or corrupted one on
 // reopen (see the constructor's doc comment).
 //
-// Not thread-safe -- concurrent access is a Phase 4 concern layered above
-// this, same as DiskManager and BufferPool.
+// Thread-safe as of Phase 4: mutex_ guards next_lsn_ and serializes each
+// AppendRecord call's full body -- LSN assignment *and* the physical
+// write() -- as one atomic unit. That's the specific property real
+// concurrency needs here: without it, two threads could interleave so
+// that the record with the *later* LSN physically lands in the file
+// before the one with the *earlier* LSN (each individual write() is
+// atomic thanks to O_APPEND, but nothing otherwise stops two threads'
+// write() calls from completing in the opposite order to their LSN
+// assignment). RunRecovery relies on file order matching LSN order
+// (see wal/recovery.h and the class comment above), so that guarantee
+// has to be held from the moment a record's LSN is handed out through
+// the moment its bytes are durably ordered in the file, not just
+// protect the counter increment in isolation.
+//
+// Flush() (fsync) and RecordsOnOpen() (fixed at construction, never
+// mutated after) touch no mutable state this mutex needs to protect,
+// so they deliberately don't take it -- see their own comments.
 class LogManager {
  public:
     // Opens (or creates) `wal_file_path` and immediately scans it: every
@@ -74,7 +90,13 @@ class LogManager {
 
     // fsyncs the WAL file. Every record appended so far becomes durable;
     // nothing appended after this call is covered until Flush() is called
-    // again.
+    // again. Deliberately unguarded by mutex_: fsync only reads the
+    // immutable fd_, and its "make durable whatever the OS has observed
+    // so far" contract is safe to call concurrently with another
+    // thread's AppendRecord -- a call from transaction Ti here is only
+    // required to guarantee Ti's own already-appended (write()-returned)
+    // records are durable, and program order on Ti's own calling thread
+    // already ensures those writes happened-before this call.
     void Flush();
 
     // Wipes the WAL file back to empty and resets the LSN counter to 1.
@@ -99,6 +121,7 @@ class LogManager {
     int fd_;
     Lsn next_lsn_;
     std::vector<LogRecord> records_on_open_;
+    mutable std::mutex mutex_;
 };
 
 }  // namespace flintdb

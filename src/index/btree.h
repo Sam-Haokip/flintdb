@@ -3,6 +3,7 @@
 #include "../storage/buffer_pool.h"
 
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -24,6 +25,62 @@ namespace flintdb {
 // BufferPool (and therefore a DiskManager/file) to build on, and in
 // Phase 2 that's always a dedicated file, separate from any HeapFile's
 // (see docs/DECISIONS.md for why one file per structure, for now).
+//
+// Thread-safe as of Phase 4, in two distinct senses layered on top of
+// each other:
+//
+// 1. Memory safety: root_mutex_ guards root_page_id_ itself, which is
+//    otherwise plain shared mutable state outside of any page (see
+//    BufferPool's own latch-vs-lock class comment for the general
+//    pattern this follows).
+//
+// 2. Transactional (isolation) correctness: every public method also
+//    acquires locks through GetCurrentTransaction()->AcquireLock (a
+//    no-op when no transaction is active, preserving every pre-Phase-4
+//    caller's behavior exactly) -- shared for read-only traversals
+//    (Search, RangeScanAll, Height), exclusive for every page an
+//    Insert/Delete traversal touches, including internal/routing nodes
+//    it only reads, not just the leaf it mutates. That's deliberately
+//    conservative: a real system would release an ancestor's lock once
+//    a child is known not to need to propagate a split/merge back up
+//    ("latch crabbing"), allowing two structural changes in unrelated
+//    subtrees to proceed concurrently. This project holds every touched
+//    page's lock for the whole operation instead (consistent with
+//    holding no lock past Strict 2PL's growing phase anyway, and with
+//    this project's stated preference for the simpler, provably-correct
+//    approach over the more concurrent one -- see docs/SPEC.md section 3
+//    and docs/DECISIONS.md).
+//
+// Memory safety alone (#1) is not sufficient for a correct concurrent
+// B-tree: page-level locks on individual *nodes* don't, on their own,
+// protect against a transaction reading a stale root_page_id_ moments
+// before a concurrent Insert splits the root and replaces it -- the
+// stale traversal would silently miss whatever moved into the new
+// sibling, a wrong answer, not a crash, so nothing here would catch it.
+// This is fixed with a synthetic "root lock sentinel" (see btree.cpp's
+// kRootLockSentinel): every public method acquires a lock on this one
+// synthetic id -- shared for reads, exclusive for anything that might
+// replace root_page_id_ -- for its whole duration, before ever reading
+// root_page_id_. Under Strict 2PL (locks held until commit, never
+// released early), this means a transaction that has read
+// root_page_id_ is guaranteed no concurrent transaction can be in the
+// middle of changing it, and vice versa: a transaction restructuring
+// the root holds the sentinel exclusively until it commits, so nobody
+// else can read (or write) root_page_id_ out from under it. The cost is
+// that Insert/Delete/Search/RangeScanAll/Height on *the same BPlusTree*
+// end up serialized against each other at the root, even when their
+// actual page-level work never overlaps -- a real system would use a
+// finer-grained scheme (e.g. an optimistic root-generation counter, or
+// treating the root pointer as just another node reached via latch
+// crabbing); this project accepts the coarser, simpler, still-correct
+// alternative, the same trade this project makes throughout Phase 4 (see
+// the class comment above and docs/DECISIONS.md).
+//
+// ValidateInvariants() is the one exception: it's explicitly
+// debug/test-only (see its own comment) and does not acquire any
+// LockManager lock, only root_mutex_ for the initial memory-safe read of
+// root_page_id_ -- it is not part of the transactional read/write API
+// surface this class otherwise provides.
 class BPlusTree {
  public:
     explicit BPlusTree(BufferPool* buffer_pool);
@@ -83,8 +140,18 @@ class BPlusTree {
     // whatever sibling/child pages it touches itself.
     void FixUnderflow(struct InternalNode& parent, size_t idx);
 
+    // Memory-safe accessors for root_page_id_ -- see the class comment's
+    // point #1. Every caller of GetRootPageId still needs its own
+    // *transactional* lock on the root sentinel (see btree.cpp) acquired
+    // beforehand; these two do not acquire that lock themselves, since
+    // ValidateInvariants() deliberately uses the memory-safe read without
+    // the transactional one.
+    PageId GetRootPageId() const;
+    void SetRootPageId(PageId page_id);
+
     BufferPool* buffer_pool_;
     PageId root_page_id_ = INVALID_PAGE_ID;
+    mutable std::mutex root_mutex_;
 };
 
 }  // namespace flintdb

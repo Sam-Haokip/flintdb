@@ -73,6 +73,11 @@ DiskManager::~DiskManager() {
 }
 
 PageId DiskManager::AllocatePage() {
+    // Held across the increment *and* the ftruncate so the two always
+    // land together: no other thread can ever observe a next_page_id_
+    // that outruns the file size it implies. See the class comment for
+    // why the lock does NOT extend to the actual page I/O methods.
+    std::lock_guard<std::mutex> lock(mutex_);
     PageId id = next_page_id_++;
     off_t new_size = static_cast<off_t>(id + 1) * static_cast<off_t>(PAGE_SIZE);
     if (ftruncate(fd_, new_size) != 0) {
@@ -82,22 +87,38 @@ PageId DiskManager::AllocatePage() {
 }
 
 void DiskManager::ReadPage(PageId page_id, char* out_buf) const {
-    if (page_id >= next_page_id_) {
-        throw std::out_of_range("DiskManager::ReadPage: page_id beyond end of file");
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (page_id >= next_page_id_) {
+            throw std::out_of_range("DiskManager::ReadPage: page_id beyond end of file");
+        }
     }
+    // pread with an explicit offset is safe to call concurrently on the
+    // same fd from multiple threads (unlike read, it never touches a
+    // shared file-position cursor), so this deliberately runs unlocked.
     FullPRead(fd_, out_buf, PAGE_SIZE, static_cast<off_t>(page_id) * static_cast<off_t>(PAGE_SIZE));
 }
 
 void DiskManager::WritePage(PageId page_id, const char* buf) {
-    if (page_id >= next_page_id_) {
-        throw std::out_of_range("DiskManager::WritePage: page_id beyond end of file");
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (page_id >= next_page_id_) {
+            throw std::out_of_range("DiskManager::WritePage: page_id beyond end of file");
+        }
     }
+    // Same reasoning as ReadPage: pwrite at an explicit offset is safe
+    // unlocked, and different transactions writing different pages
+    // concurrently is exactly the concurrency Phase 4 is meant to allow.
     FullPWrite(fd_, buf, PAGE_SIZE, static_cast<off_t>(page_id) * static_cast<off_t>(PAGE_SIZE));
 }
 
-size_t DiskManager::NumPages() const { return next_page_id_; }
+size_t DiskManager::NumPages() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return next_page_id_;
+}
 
 void DiskManager::ResetFile() {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (ftruncate(fd_, 0) != 0) {
         throw std::runtime_error(std::string("DiskManager::ResetFile: ftruncate failed: ") + std::strerror(errno));
     }

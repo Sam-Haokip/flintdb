@@ -182,6 +182,10 @@ const std::vector<LogRecord>& LogManager::RecordsOnOpen() const { return records
 
 Lsn LogManager::AppendRecord(LogRecordType type, TxnId txn_id, PageId page_id, const char* payload,
                               uint32_t payload_len) {
+    // Held across LSN assignment *and* the physical write() -- see the
+    // class comment for why both have to be inside one critical section,
+    // not just the counter increment.
+    std::lock_guard<std::mutex> lock(mutex_);
     Lsn lsn = next_lsn_++;
 
     std::vector<char> buf(kHeaderSize + payload_len + kChecksumSize);
@@ -223,12 +227,16 @@ void LogManager::Flush() {
 }
 
 void LogManager::Checkpoint() {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (ftruncate(fd_, 0) != 0) {
         throw std::runtime_error(std::string("LogManager::Checkpoint: ftruncate failed: ") + std::strerror(errno));
     }
     next_lsn_ = 1;
 }
 
-Lsn LogManager::NextLsn() const { return next_lsn_; }
+Lsn LogManager::NextLsn() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return next_lsn_;
+}
 
 }  // namespace flintdb

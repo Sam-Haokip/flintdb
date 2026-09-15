@@ -1,11 +1,27 @@
 #include "heap_file.h"
 
+#include "../txn/transaction.h"
+
 #include <algorithm>
 #include <stdexcept>
 
 namespace flintdb {
 
+namespace {
+
+// Acquires `mode` on `page_id` through the calling thread's current
+// transaction, if any -- a no-op when GetCurrentTransaction() is
+// nullptr, preserving every pre-Phase-4, non-transactional caller's
+// behavior exactly. Mirrors btree.cpp's identical helper.
+void LockPage(PageId page_id, LockMode mode) {
+    if (Transaction* txn = GetCurrentTransaction()) txn->AcquireLock(page_id, mode);
+}
+
+}  // namespace
+
 HeapFile::HeapFile(BufferPool* buffer_pool) : buffer_pool_(buffer_pool) {
+    // No locking needed: object construction happens before any other
+    // thread can possibly have a reference to this HeapFile.
     size_t existing = buffer_pool_->NumPagesOnDisk();
     page_ids_.reserve(existing);
     for (PageId pid = 0; pid < existing; pid++) {
@@ -19,9 +35,21 @@ RID HeapFile::Insert(const std::string& row_bytes) {
         throw std::invalid_argument("HeapFile::Insert: row is larger than a page can ever hold");
     }
 
-    // Common case: the most recently allocated page still has room.
-    if (!page_ids_.empty()) {
-        PageId last = page_ids_.back();
+    // Common case: the most recently allocated page still has room. The
+    // page_ids_ read is a quick snapshot under the latch, released
+    // before locking/fetching the page itself -- see the class comment
+    // on why a page that's no longer truly "last" by the time we act on
+    // it is fine (InsertRecord's own nullopt fallback already handles
+    // that, same as before Phase 4).
+    bool have_last;
+    PageId last = INVALID_PAGE_ID;
+    {
+        std::lock_guard<std::mutex> lock(page_ids_mutex_);
+        have_last = !page_ids_.empty();
+        if (have_last) last = page_ids_.back();
+    }
+    if (have_last) {
+        LockPage(last, LockMode::kExclusive);
         Page* page = buffer_pool_->FetchPage(last);
         auto slot = page->InsertRecord(row_bytes);
         if (slot.has_value()) {
@@ -33,7 +61,11 @@ RID HeapFile::Insert(const std::string& row_bytes) {
     // Otherwise allocate a fresh page for it.
     PageId new_pid;
     Page* page = buffer_pool_->NewHeapPage(&new_pid);
-    page_ids_.push_back(new_pid);
+    LockPage(new_pid, LockMode::kExclusive);  // bookkeeping only -- a brand-new page can't conflict with anyone
+    {
+        std::lock_guard<std::mutex> lock(page_ids_mutex_);
+        page_ids_.push_back(new_pid);
+    }
     auto slot = page->InsertRecord(row_bytes);
     if (!slot.has_value()) {
         // Can only happen if kMaxRowSize above is wrong; a fresh empty
@@ -45,8 +77,15 @@ RID HeapFile::Insert(const std::string& row_bytes) {
 }
 
 std::vector<std::pair<RID, std::string>> HeapFile::Scan() const {
+    std::vector<PageId> page_ids_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(page_ids_mutex_);
+        page_ids_snapshot = page_ids_;
+    }
+
     std::vector<std::pair<RID, std::string>> out;
-    for (PageId pid : page_ids_) {
+    for (PageId pid : page_ids_snapshot) {
+        LockPage(pid, LockMode::kShared);
         Page* page = buffer_pool_->FetchPage(pid);
         uint16_t n = page->GetSlotCount();
         for (SlotId s = 0; s < n; s++) {
@@ -60,7 +99,14 @@ std::vector<std::pair<RID, std::string>> HeapFile::Scan() const {
 size_t HeapFile::NumRows() const { return Scan().size(); }
 
 std::optional<RID> HeapFile::Find(const std::function<bool(const std::string&)>& pred) const {
-    for (PageId pid : page_ids_) {
+    std::vector<PageId> page_ids_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(page_ids_mutex_);
+        page_ids_snapshot = page_ids_;
+    }
+
+    for (PageId pid : page_ids_snapshot) {
+        LockPage(pid, LockMode::kShared);
         Page* page = buffer_pool_->FetchPage(pid);
         uint16_t n = page->GetSlotCount();
         for (SlotId s = 0; s < n; s++) {
@@ -73,9 +119,15 @@ std::optional<RID> HeapFile::Find(const std::function<bool(const std::string&)>&
 }
 
 bool HeapFile::Delete(RID rid) {
-    if (std::find(page_ids_.begin(), page_ids_.end(), rid.page_id) == page_ids_.end()) {
+    bool owns_page;
+    {
+        std::lock_guard<std::mutex> lock(page_ids_mutex_);
+        owns_page = std::find(page_ids_.begin(), page_ids_.end(), rid.page_id) != page_ids_.end();
+    }
+    if (!owns_page) {
         return false;  // not a page this heap file owns
     }
+    LockPage(rid.page_id, LockMode::kExclusive);
     Page* page = buffer_pool_->FetchPage(rid.page_id);
     if (rid.slot_id >= page->GetSlotCount() || page->IsDeleted(rid.slot_id)) {
         return false;

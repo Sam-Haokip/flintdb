@@ -2,6 +2,10 @@
 #include "test_framework.h"
 #include "test_utils.h"
 
+#include <set>
+#include <thread>
+#include <vector>
+
 using namespace flintdb;
 using flintdb::testing::CorruptByteAt;
 using flintdb::testing::FileSizeOf;
@@ -225,4 +229,51 @@ FLINTDB_TEST(log_manager_flush_does_not_throw_and_records_remain_readable) {
     log.AppendCommit(1);
     log.Flush();
     FLINTDB_CHECK_EQ(log.RecordsOnOpen().size(), 0u);  // RecordsOnOpen is fixed at construction time
+}
+
+FLINTDB_TEST(log_manager_concurrent_appends_assign_unique_lsns_that_never_land_out_of_order_on_disk) {
+    // Phase 4: many threads appending at once must never (a) hand out a
+    // duplicate LSN, or (b) let a later-LSN record's bytes land in the
+    // file before an earlier-LSN record's bytes -- the second is the
+    // subtler bug: each individual write() is atomic (O_APPEND), but
+    // without AppendRecord's own mutex serializing "assign LSN, then
+    // write" as one unit, two threads could still assign LSNs 5 and 6
+    // and then have LSN 6's write() physically complete first. Since the
+    // constructor's parser never itself checks LSN monotonicity (it only
+    // checks type/payload/checksum -- see the class comment), a genuine
+    // out-of-order write would silently corrupt recovery's LSN-order
+    // replay rather than fail loudly here, so this test checks file
+    // order against LSN order directly, via a fresh reopen.
+    TempFile tmp("wal");
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 100;
+    std::vector<std::vector<Lsn>> results(kThreads);
+    {
+        LogManager log(tmp.path());
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&log, &results, t] {
+                results[t].reserve(kPerThread);
+                for (int i = 0; i < kPerThread; ++i) {
+                    results[t].push_back(log.AppendBegin(static_cast<TxnId>(t * kPerThread + i)));
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+    }  // LogManager destructs here, closing the fd -- reopen fresh below to read purely from disk
+
+    std::set<Lsn> all_lsns;
+    for (auto& per_thread : results) {
+        for (Lsn lsn : per_thread) all_lsns.insert(lsn);
+    }
+    FLINTDB_CHECK_EQ(all_lsns.size(), static_cast<size_t>(kThreads * kPerThread));  // no duplicates
+    FLINTDB_CHECK_EQ(*all_lsns.begin(), 1u);
+    FLINTDB_CHECK_EQ(*all_lsns.rbegin(), static_cast<Lsn>(kThreads * kPerThread));
+
+    LogManager reopened(tmp.path());
+    const auto& on_disk = reopened.RecordsOnOpen();
+    FLINTDB_CHECK_EQ(on_disk.size(), static_cast<size_t>(kThreads * kPerThread));
+    for (size_t i = 0; i + 1 < on_disk.size(); ++i) {
+        FLINTDB_CHECK(on_disk[i].lsn < on_disk[i + 1].lsn);  // strictly increasing -- file order == LSN order
+    }
 }

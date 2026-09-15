@@ -11,6 +11,9 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 add_library(flintdb_core STATIC
   src/storage/page.cpp
   src/storage/disk_manager.cpp
@@ -20,8 +23,11 @@ add_library(flintdb_core STATIC
   src/wal/log_manager.cpp
   src/wal/recovery.cpp
   src/txn/transaction_manager.cpp
+  src/txn/lock_manager.cpp
+  src/txn/transaction.cpp
 )
 target_include_directories(flintdb_core PUBLIC src)
+target_link_libraries(flintdb_core PUBLIC Threads::Threads)
 
 add_executable(flintdb_tests
   tests/test_main.cpp
@@ -34,6 +40,9 @@ add_executable(flintdb_tests
   tests/test_recovery.cpp
   tests/test_transaction.cpp
   tests/test_crash_recovery.cpp
+  tests/test_lock_manager.cpp
+  tests/test_transaction_context.cpp
+  tests/test_isolation.cpp
 )
 target_link_libraries(flintdb_tests PRIVATE flintdb_core)
 target_include_directories(flintdb_tests PRIVATE tests)

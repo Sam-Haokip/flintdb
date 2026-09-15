@@ -4,6 +4,9 @@
 
 #include <cstring>
 #include <fstream>
+#include <set>
+#include <thread>
+#include <vector>
 
 using namespace flintdb;
 using flintdb::testing::TempFile;
@@ -126,4 +129,86 @@ FLINTDB_TEST(disk_manager_rejects_a_file_whose_size_is_not_page_aligned) {
         threw = true;
     }
     FLINTDB_CHECK(threw);
+}
+
+FLINTDB_TEST(disk_manager_concurrent_allocate_never_hands_out_a_duplicate_page_id) {
+    // Phase 4: many threads racing AllocatePage on the same DiskManager
+    // must each get a distinct id covering exactly [0, N), with the file
+    // ending up exactly N pages long -- proving next_page_id_'s
+    // increment-then-ftruncate is genuinely atomic under real
+    // concurrency, not just single-threaded-correct.
+    TempFile tmp;
+    DiskManager dm(tmp.path());
+
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 200;
+    std::vector<std::vector<PageId>> results(kThreads);
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&dm, &results, t] {
+            results[t].reserve(kPerThread);
+            for (int i = 0; i < kPerThread; ++i) {
+                results[t].push_back(dm.AllocatePage());
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    std::set<PageId> all_ids;
+    for (auto& per_thread : results) {
+        for (PageId id : per_thread) all_ids.insert(id);
+    }
+    FLINTDB_CHECK_EQ(all_ids.size(), static_cast<size_t>(kThreads * kPerThread));
+    FLINTDB_CHECK_EQ(*all_ids.begin(), 0u);
+    FLINTDB_CHECK_EQ(*all_ids.rbegin(), static_cast<PageId>(kThreads * kPerThread - 1));
+    FLINTDB_CHECK_EQ(dm.NumPages(), static_cast<size_t>(kThreads * kPerThread));
+}
+
+FLINTDB_TEST(disk_manager_concurrent_reads_and_writes_to_different_pages_do_not_corrupt_each_other) {
+    // Each thread owns exactly one pre-allocated page and repeatedly
+    // writes-then-reads-back a byte pattern unique to that page, all
+    // threads running at once -- proving concurrent pread/pwrite at
+    // different offsets on the same fd never bleed into each other, and
+    // that ReadPage/WritePage's bounds check races correctly with
+    // AllocatePage having already grown the file for every page used
+    // here.
+    TempFile tmp;
+    DiskManager dm(tmp.path());
+
+    constexpr int kThreads = 8;
+    std::vector<PageId> pages;
+    for (int t = 0; t < kThreads; ++t) pages.push_back(dm.AllocatePage());
+
+    std::vector<std::thread> threads;
+    // Deliberately std::vector<char>, not std::vector<bool>: vector<bool>
+    // is bit-packed, so distinct elements can share an underlying storage
+    // word -- writing ok[t] from different threads for different t would
+    // then race on that shared word even though the indices themselves
+    // don't overlap. This is a real trap ThreadSanitizer caught here
+    // during Phase 4 (see docs/DECISIONS.md): a genuine data race, but in
+    // this test's own bookkeeping, not in DiskManager. vector<char> gives
+    // every element its own byte, so no such aliasing is possible.
+    std::vector<char> ok(kThreads, 0);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&dm, &pages, &ok, t] {
+            char pattern = static_cast<char>('A' + t);
+            char write_buf[PAGE_SIZE];
+            std::memset(write_buf, pattern, PAGE_SIZE);
+
+            bool all_rounds_ok = true;
+            for (int round = 0; round < 50; ++round) {
+                dm.WritePage(pages[static_cast<size_t>(t)], write_buf);
+                char read_buf[PAGE_SIZE];
+                dm.ReadPage(pages[static_cast<size_t>(t)], read_buf);
+                if (std::memcmp(write_buf, read_buf, PAGE_SIZE) != 0) all_rounds_ok = false;
+            }
+            ok[static_cast<size_t>(t)] = all_rounds_ok ? 1 : 0;
+        });
+    }
+    for (auto& th : threads) th.join();
+
+    for (int t = 0; t < kThreads; ++t) {
+        FLINTDB_CHECK(ok[static_cast<size_t>(t)] == 1);
+    }
 }
