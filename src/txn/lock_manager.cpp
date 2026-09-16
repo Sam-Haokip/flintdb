@@ -25,20 +25,21 @@ std::set<TxnId> LockManager::OtherHolders(const LockEntry& entry, TxnId txn_id) 
     return others;
 }
 
-void LockManager::AcquireLock(TxnId txn_id, PageId page_id, LockMode mode) {
+void LockManager::AcquireLock(TxnId txn_id, ObjectId object_id, PageId page_id, LockMode mode) {
+    PageKey key{object_id, page_id};
     std::unique_lock<std::mutex> lock(mutex_);
     while (true) {
-        auto it = locks_.find(page_id);
+        auto it = locks_.find(key);
         if (it == locks_.end()) {
             // Nobody holds this page at all -- grant immediately, no
             // conflict possible.
-            LockEntry& fresh = locks_[page_id];
+            LockEntry& fresh = locks_[key];
             if (mode == LockMode::kExclusive) {
                 fresh.exclusive_holder = txn_id;
             } else {
                 fresh.shared_holders.insert(txn_id);
             }
-            held_by_txn_[txn_id].insert(page_id);
+            held_by_txn_[txn_id].insert(key);
             return;
         }
 
@@ -60,7 +61,7 @@ void LockManager::AcquireLock(TxnId txn_id, PageId page_id, LockMode mode) {
             } else {
                 entry.shared_holders.insert(txn_id);
             }
-            held_by_txn_[txn_id].insert(page_id);
+            held_by_txn_[txn_id].insert(key);
             return;
         }
 
@@ -88,8 +89,8 @@ void LockManager::ReleaseAll(TxnId txn_id) {
     auto it = held_by_txn_.find(txn_id);
     if (it == held_by_txn_.end()) return;
 
-    for (PageId page_id : it->second) {
-        auto lock_it = locks_.find(page_id);
+    for (const PageKey& key : it->second) {
+        auto lock_it = locks_.find(key);
         if (lock_it == locks_.end()) continue;
         LockEntry& entry = lock_it->second;
         entry.shared_holders.erase(txn_id);

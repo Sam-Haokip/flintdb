@@ -13,6 +13,51 @@ namespace flintdb {
 
 enum class LockMode { kShared, kExclusive };
 
+// A page address qualified by which object (table or index -- one
+// physical file) it belongs to. As of Phase 5, a bare PageId is only
+// unique *within* one object's own file (docs/DECISIONS.md D-031); two
+// different objects each number their pages independently starting at 0,
+// so LockManager's lock table -- shared across every object in one
+// Database (D-032) -- has to key on the pair, not the PageId alone, or
+// table T's page 3 and index I's page 3 would collide as if they were
+// the same page. Mirrors RID's identical compound-key pattern
+// (common/rid.h).
+struct PageKey {
+    ObjectId object_id = INVALID_OBJECT_ID;
+    PageId page_id = INVALID_PAGE_ID;
+
+    bool operator==(const PageKey& other) const {
+        return object_id == other.object_id && page_id == other.page_id;
+    }
+    bool operator!=(const PageKey& other) const { return !(*this == other); }
+    bool operator<(const PageKey& other) const {
+        if (object_id != other.object_id) return object_id < other.object_id;
+        return page_id < other.page_id;
+    }
+};
+
+}  // namespace flintdb
+
+// This specialization must be visible before PageKey is ever used as an
+// unordered_map key (LockManager::locks_ below is exactly that use) --
+// std::unordered_map<PageKey, ...> implicitly instantiates the primary
+// std::hash<PageKey> template the moment that type is named, and a
+// specialization declared *after* that implicit instantiation is a real
+// ODR violation (GCC correctly rejects it: "specialization ... after
+// instantiation"), not just a style nit. Caught the hard way: an earlier
+// version of this file defined this specialization down at the bottom,
+// after LockManager's own class body -- see docs/DECISIONS.md.
+namespace std {
+template <>
+struct hash<flintdb::PageKey> {
+    size_t operator()(const flintdb::PageKey& key) const noexcept {
+        return (static_cast<size_t>(key.object_id) << 32) ^ static_cast<size_t>(key.page_id);
+    }
+};
+}  // namespace std
+
+namespace flintdb {
+
 // Thrown by LockManager::AcquireLock when the requesting transaction is
 // chosen as a wait-die "victim" -- it must abort (see the class comment
 // below for the full rule). Whoever calls AcquireLock (directly, or via
@@ -36,7 +81,10 @@ class TransactionAbortedException : public std::runtime_error {
 // abort (ReleaseAll) -- never one at a time, which is what makes this
 // "strict" 2PL rather than plain 2PL, and is also exactly what makes
 // deadlock possible in the first place (a transaction can end up holding
-// a lock another transaction needs while waiting for a third).
+// a lock another transaction needs while waiting for a third). As of
+// Phase 5, one LockManager is shared across every table and index in a
+// Database (docs/DECISIONS.md D-032), so every key is a PageKey (object +
+// page), not a bare PageId -- see PageKey's own comment above for why.
 //
 // Deadlocks are *prevented*, not detected after the fact, using wait-die:
 // transaction ids are assigned monotonically increasing by
@@ -65,8 +113,9 @@ class LockManager {
     LockManager(const LockManager&) = delete;
     LockManager& operator=(const LockManager&) = delete;
 
-    // Acquires `mode` on `page_id` for `txn_id`. Returns immediately if
-    // `txn_id` already holds a sufficient lock on this page (including
+    // Acquires `mode` on `page_id` (within `object_id`'s own file, see
+    // PageKey above) for `txn_id`. Returns immediately if `txn_id`
+    // already holds a sufficient lock on this page (including
     // re-requesting the same mode, or requesting shared while already
     // holding exclusive). Upgrades in place (shared -> exclusive) if
     // `txn_id` is the page's only shared holder and no one else holds it.
@@ -74,7 +123,7 @@ class LockManager {
     // TransactionAbortedException per the wait-die rule described above
     // -- which happens without blocking at all, so a call to this never
     // both throws and waits.
-    void AcquireLock(TxnId txn_id, PageId page_id, LockMode mode);
+    void AcquireLock(TxnId txn_id, ObjectId object_id, PageId page_id, LockMode mode);
 
     // Releases every lock `txn_id` currently holds, all at once (Strict
     // 2PL never releases a lock before end of transaction). Safe to call
@@ -104,8 +153,8 @@ class LockManager {
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
-    std::unordered_map<PageId, LockEntry> locks_;
-    std::unordered_map<TxnId, std::set<PageId>> held_by_txn_;
+    std::unordered_map<PageKey, LockEntry> locks_;
+    std::unordered_map<TxnId, std::set<PageKey>> held_by_txn_;
 };
 
 }  // namespace flintdb

@@ -47,7 +47,7 @@ FLINTDB_TEST(log_manager_reopen_sees_every_appended_record_in_order_with_correct
     {
         LogManager log(tmp.path());
         log.AppendBegin(42);
-        log.AppendUpdate(42, 7, image.data());
+        log.AppendUpdate(42, 5, 7, image.data());
         log.AppendCommit(42);
         log.Flush();
     }
@@ -63,6 +63,7 @@ FLINTDB_TEST(log_manager_reopen_sees_every_appended_record_in_order_with_correct
     FLINTDB_CHECK(records[1].type == LogRecordType::kUpdate);
     FLINTDB_CHECK_EQ(records[1].lsn, 2u);
     FLINTDB_CHECK_EQ(records[1].txn_id, 42u);
+    FLINTDB_CHECK_EQ(records[1].object_id, 5u);
     FLINTDB_CHECK_EQ(records[1].page_id, 7u);
     FLINTDB_CHECK(records[1].page_image == image);
 
@@ -93,8 +94,8 @@ FLINTDB_TEST(log_manager_multiple_update_records_each_keep_their_own_page_image)
     auto image_b = MakePageImage('B');
     {
         LogManager log(tmp.path());
-        log.AppendUpdate(1, 10, image_a.data());
-        log.AppendUpdate(1, 20, image_b.data());
+        log.AppendUpdate(1, 0, 10, image_a.data());
+        log.AppendUpdate(1, 0, 20, image_b.data());
     }
     LogManager reopened(tmp.path());
     const auto& records = reopened.RecordsOnOpen();
@@ -102,6 +103,31 @@ FLINTDB_TEST(log_manager_multiple_update_records_each_keep_their_own_page_image)
     FLINTDB_CHECK_EQ(records[0].page_id, 10u);
     FLINTDB_CHECK(records[0].page_image == image_a);
     FLINTDB_CHECK_EQ(records[1].page_id, 20u);
+    FLINTDB_CHECK(records[1].page_image == image_b);
+}
+
+FLINTDB_TEST(log_manager_update_records_keep_object_id_independent_of_page_id) {
+    // Phase 5, docs/DECISIONS.md D-032: the WAL's whole reason object_id
+    // exists is that page_id alone is only unique within one object's own
+    // file. Two Update records with the *same* page_id but different
+    // object_id must round-trip as two distinct, independently-addressed
+    // records, not collapse or get confused with each other.
+    TempFile tmp("wal");
+    auto image_a = MakePageImage('A');
+    auto image_b = MakePageImage('B');
+    {
+        LogManager log(tmp.path());
+        log.AppendUpdate(1, 3, 100, image_a.data());  // object 3, page 100
+        log.AppendUpdate(1, 9, 100, image_b.data());  // object 9, *same* page 100
+    }
+    LogManager reopened(tmp.path());
+    const auto& records = reopened.RecordsOnOpen();
+    FLINTDB_CHECK_EQ(records.size(), 2u);
+    FLINTDB_CHECK_EQ(records[0].object_id, 3u);
+    FLINTDB_CHECK_EQ(records[0].page_id, 100u);
+    FLINTDB_CHECK(records[0].page_image == image_a);
+    FLINTDB_CHECK_EQ(records[1].object_id, 9u);
+    FLINTDB_CHECK_EQ(records[1].page_id, 100u);
     FLINTDB_CHECK(records[1].page_image == image_b);
 }
 
@@ -115,7 +141,7 @@ FLINTDB_TEST(log_manager_torn_tail_after_a_full_record_is_discarded_and_file_is_
         // Simulate a crash mid-write of the *next* record: an Update
         // record (large payload) that never finished landing on disk.
         auto image = MakePageImage('Z');
-        log.AppendUpdate(1, 3, image.data());
+        log.AppendUpdate(1, 0, 3, image.data());
     }
     size_t full_size = FileSizeOf(tmp.path());
     FLINTDB_CHECK(full_size > good_size);
@@ -140,7 +166,7 @@ FLINTDB_TEST(log_manager_torn_write_of_the_very_first_record_leaves_an_empty_log
     {
         LogManager log(tmp.path());
         auto image = MakePageImage('Z');
-        log.AppendUpdate(1, 3, image.data());
+        log.AppendUpdate(1, 0, 3, image.data());
     }
     // Truncate mid-header of the one and only record.
     TruncateFileTo(tmp.path(), 10);
@@ -179,11 +205,11 @@ FLINTDB_TEST(log_manager_corrupted_page_image_byte_is_detected_via_checksum) {
     {
         LogManager log(tmp.path());
         auto image = MakePageImage('M');
-        log.AppendUpdate(1, 5, image.data());
+        log.AppendUpdate(1, 0, 5, image.data());
     }
     // Flip a byte deep inside the update record's page-image payload
-    // (well past the 25-byte header).
-    CorruptByteAt(tmp.path(), 25 + 2000);
+    // (well past the 29-byte header).
+    CorruptByteAt(tmp.path(), 29 + 2000);
 
     LogManager reopened(tmp.path());
     FLINTDB_CHECK(reopened.RecordsOnOpen().empty());

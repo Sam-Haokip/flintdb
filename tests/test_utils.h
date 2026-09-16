@@ -37,6 +37,38 @@ class TempFile {
     static inline int counter_ = 0;
 };
 
+// A unique on-disk *directory* path that recursively deletes itself (and
+// everything a test put in it) on destruction -- the directory-shaped
+// counterpart to TempFile, for tests of anything that owns a whole
+// directory of files rather than one file (Catalog's metadata file plus
+// its per-object data files; Database, once it exists). Deliberately does
+// NOT create the directory itself: callers that need "a fresh directory
+// that already exists" call std::filesystem::create_directory(path())
+// themselves, since some tests (e.g. Catalog's own constructor) want to
+// exercise creating it for the first time.
+class TempDir {
+ public:
+    TempDir() {
+        auto dir = std::filesystem::temp_directory_path();
+        path_ = (dir / ("flintdb_test_dir_" + std::to_string(counter_++) + "_" +
+                         std::to_string(reinterpret_cast<uintptr_t>(this))))
+                    .string();
+    }
+    ~TempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+
+    const std::string& path() const { return path_; }
+
+ private:
+    std::string path_;
+    static inline int counter_ = 0;
+};
+
 // Raw filesystem helpers for simulating a crash directly on an on-disk
 // file, deliberately going around whatever object (LogManager,
 // DiskManager, ...) normally owns it. This is the technique

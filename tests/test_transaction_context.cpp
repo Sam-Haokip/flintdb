@@ -55,13 +55,13 @@ FLINTDB_TEST(transaction_context_is_independent_per_thread) {
 
 FLINTDB_TEST(transaction_acquire_lock_is_a_no_op_with_a_null_lock_manager) {
     Transaction txn(1, nullptr);
-    txn.AcquireLock(100, LockMode::kExclusive);  // must not throw or crash
+    txn.AcquireLock(0, 100, LockMode::kExclusive);  // must not throw or crash
 }
 
 FLINTDB_TEST(transaction_acquire_lock_routes_through_the_shared_lock_manager) {
     LockManager lm;
     Transaction txn(7, &lm);
-    txn.AcquireLock(100, LockMode::kExclusive);
+    txn.AcquireLock(0, 100, LockMode::kExclusive);
     FLINTDB_CHECK(lm.HasAnyLock(7));
 }
 
@@ -69,15 +69,35 @@ FLINTDB_TEST(transaction_acquire_lock_propagates_a_wait_die_abort_as_transaction
     LockManager lm;
     TxnId older = 1;
     TxnId younger = 2;
-    lm.AcquireLock(older, 100, LockMode::kExclusive);  // held directly, simulating another transaction
+    lm.AcquireLock(older, 0, 100, LockMode::kExclusive);  // held directly, simulating another transaction
 
     Transaction younger_txn(younger, &lm);
     bool threw = false;
     try {
-        younger_txn.AcquireLock(100, LockMode::kExclusive);  // must die, not wait -- younger than older
+        younger_txn.AcquireLock(0, 100, LockMode::kExclusive);  // must die, not wait -- younger than older
     } catch (const TransactionAbortedException& e) {
         threw = true;
         FLINTDB_CHECK_EQ(e.txn_id, younger);
     }
     FLINTDB_CHECK(threw);
+}
+
+FLINTDB_TEST(transaction_acquire_lock_the_same_page_id_under_a_different_object_id_is_independent) {
+    // A Transaction-level proof of D-032, one layer up from LockManager's
+    // own test: acquiring page 100 exclusively in object 1 must not make
+    // AcquireLock(object 2, page 100, ...) see any conflict at all.
+    LockManager lm;
+    Transaction txn(1, &lm);
+    txn.AcquireLock(1, 100, LockMode::kExclusive);
+    txn.AcquireLock(2, 100, LockMode::kExclusive);  // same numeric page id, different object -- must not throw
+    FLINTDB_CHECK(lm.HasAnyLock(1));
+}
+
+FLINTDB_TEST(transaction_notify_dirty_tracks_object_and_page_pairs_independently) {
+    LockManager lm;
+    Transaction txn(1, &lm);
+    txn.NotifyDirty(1, 100);
+    txn.NotifyDirty(2, 100);  // same numeric page id, different object -- must be a second entry, not a no-op
+    txn.NotifyDirty(1, 100);  // duplicate of the first -- must not add a third entry
+    FLINTDB_CHECK_EQ(txn.DirtiedPages().size(), 2u);
 }

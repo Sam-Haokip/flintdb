@@ -3,7 +3,6 @@
 #include "../storage/buffer_pool.h"
 
 #include <cstdint>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -29,10 +28,17 @@ namespace flintdb {
 // Thread-safe as of Phase 4, in two distinct senses layered on top of
 // each other:
 //
-// 1. Memory safety: root_mutex_ guards root_page_id_ itself, which is
-//    otherwise plain shared mutable state outside of any page (see
-//    BufferPool's own latch-vs-lock class comment for the general
-//    pattern this follows).
+// 1. Memory safety: GetRootPageId/SetRootPageId (below) read and write
+//    the root pointer through buffer_pool_->FetchPage every time, never
+//    caching it in a BPlusTree-local field -- see docs/DECISIONS.md
+//    D-042 for why an earlier version of this class *did* cache it in a
+//    root_page_id_ member, and why that was a real bug (Transaction::
+//    Abort can revert the header page's content via BufferPool::
+//    DiscardPage without any way to tell a separate in-memory copy that
+//    happened). With no BPlusTree-local copy left to protect, memory
+//    safety for the underlying Page* comes entirely from BufferPool's
+//    own internal mutex_ -- the same guarantee every other BufferPool
+//    consumer already relies on -- so no extra mutex is needed here.
 //
 // 2. Transactional (isolation) correctness: every public method also
 //    acquires locks through GetCurrentTransaction()->AcquireLock (a
@@ -57,15 +63,15 @@ namespace flintdb {
 // before a concurrent Insert splits the root and replaces it -- the
 // stale traversal would silently miss whatever moved into the new
 // sibling, a wrong answer, not a crash, so nothing here would catch it.
-// This is fixed with a synthetic "root lock sentinel" (see btree.cpp's
-// kRootLockSentinel): every public method acquires a lock on this one
-// synthetic id -- shared for reads, exclusive for anything that might
+// This is fixed by giving "the root pointer as a whole" its own lock
+// target: every public method acquires a lock on page 0 of this tree's
+// own file -- shared for reads, exclusive for anything that might
 // replace root_page_id_ -- for its whole duration, before ever reading
 // root_page_id_. Under Strict 2PL (locks held until commit, never
 // released early), this means a transaction that has read
 // root_page_id_ is guaranteed no concurrent transaction can be in the
 // middle of changing it, and vice versa: a transaction restructuring
-// the root holds the sentinel exclusively until it commits, so nobody
+// the root holds page 0's lock exclusively until it commits, so nobody
 // else can read (or write) root_page_id_ out from under it. The cost is
 // that Insert/Delete/Search/RangeScanAll/Height on *the same BPlusTree*
 // end up serialized against each other at the root, even when their
@@ -76,14 +82,44 @@ namespace flintdb {
 // alternative, the same trade this project makes throughout Phase 4 (see
 // the class comment above and docs/DECISIONS.md).
 //
+// Why page 0 specifically, and not a synthetic non-page id (which is
+// what an earlier version of this design used): as of Phase 5
+// (docs/DECISIONS.md D-036), page 0 of this tree's own file is reserved
+// to durably *store* root_page_id_ (see the constructor and
+// SetRootPageId in btree.cpp) -- root_page_id_ was, before D-036, never
+// actually persisted at all, a real Phase 2 gap that no test caught
+// because no Phase 2-4 test ever closed and reopened a BPlusTree over
+// the same file. Once the root pointer's storage is a real page, locking
+// that real page *is* locking the root pointer -- no separate synthetic
+// id is needed, and mutating it goes through the ordinary
+// BufferPool::MarkDirty path, which makes it durable and crash-recoverable
+// via the existing WAL/recovery machinery for free, with no bespoke
+// persistence mechanism of its own.
+//
 // ValidateInvariants() is the one exception: it's explicitly
 // debug/test-only (see its own comment) and does not acquire any
-// LockManager lock, only root_mutex_ for the initial memory-safe read of
-// root_page_id_ -- it is not part of the transactional read/write API
-// surface this class otherwise provides.
+// LockManager lock for its initial read of the root pointer, relying
+// only on the memory safety GetRootPageId() already provides via
+// BufferPool (point #1 above) -- it is not part of the transactional
+// read/write API surface this class otherwise provides.
 class BPlusTree {
  public:
-    explicit BPlusTree(BufferPool* buffer_pool);
+    // `object_id` (Phase 5, docs/DECISIONS.md D-031/D-032) identifies
+    // this index's own file within a shared LockManager/WAL -- see
+    // HeapFile's constructor comment (storage/heap_file.h) for the full
+    // rationale, which applies identically here.
+    //
+    // If `buffer_pool`'s underlying file is not empty (i.e. this is
+    // reopening an existing index file), page 0 is assumed to already be
+    // this tree's header page (see the class comment on D-036) -- nothing
+    // needs to be read back from it here, since GetRootPageId() (below)
+    // reads it fresh on every call rather than caching it at construction
+    // time (docs/DECISIONS.md D-042). Otherwise (a brand-new file), page 0
+    // is freshly allocated and initialized as an empty tree's header. This
+    // must be the very first page ever touched on `buffer_pool` for a
+    // fresh file, so that page 0 is guaranteed to be the header and never
+    // collide with a real leaf/internal node's id.
+    BPlusTree(ObjectId object_id, BufferPool* buffer_pool);
 
     void Insert(int64_t key, RID rid);
 
@@ -140,18 +176,22 @@ class BPlusTree {
     // whatever sibling/child pages it touches itself.
     void FixUnderflow(struct InternalNode& parent, size_t idx);
 
-    // Memory-safe accessors for root_page_id_ -- see the class comment's
-    // point #1. Every caller of GetRootPageId still needs its own
-    // *transactional* lock on the root sentinel (see btree.cpp) acquired
-    // beforehand; these two do not acquire that lock themselves, since
-    // ValidateInvariants() deliberately uses the memory-safe read without
-    // the transactional one.
+    // Reads/writes the root pointer directly through the header page
+    // (page 0, D-036) on every call -- see the class comment's point #1
+    // and docs/DECISIONS.md D-042 for why this is deliberately *not*
+    // cached in a BPlusTree-local field. Every caller of GetRootPageId
+    // still needs its own *transactional* lock on page 0 (see btree.cpp's
+    // LockRoot) acquired beforehand; these two do not acquire that lock
+    // themselves, since ValidateInvariants() deliberately uses the
+    // memory-safe read without the transactional one. SetRootPageId
+    // persists the new value via BufferPool::MarkDirty (D-036) -- every
+    // caller already holds page 0's lock exclusively before calling it,
+    // for the reason explained in the class comment.
     PageId GetRootPageId() const;
     void SetRootPageId(PageId page_id);
 
+    ObjectId object_id_;
     BufferPool* buffer_pool_;
-    PageId root_page_id_ = INVALID_PAGE_ID;
-    mutable std::mutex root_mutex_;
 };
 
 }  // namespace flintdb

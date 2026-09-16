@@ -50,9 +50,31 @@ class HeapFile {
     // If the buffer pool's underlying file already has pages (i.e. this is
     // reopening an existing .db file), those pages are assumed to all
     // belong to this heap file and are picked up automatically.
-    explicit HeapFile(BufferPool* buffer_pool);
+    //
+    // `object_id` (Phase 5, docs/DECISIONS.md D-031/D-032) identifies
+    // this heap file's own table within a shared LockManager/WAL: every
+    // LockManager::AcquireLock call this class makes is keyed by
+    // (object_id, page_id), not a bare page_id, since Phase 5 lets many
+    // tables/indexes -- each with page ids starting back at 0 in their
+    // own file -- share one LockManager. A HeapFile constructed directly
+    // (as every pre-Phase-5 test still does) rather than through the
+    // Database facade can pass any fixed id (0 is the convention this
+    // codebase's own tests use) as long as it's unique among whatever
+    // other objects share the same LockManager/TransactionManager in that
+    // scope -- see transaction_manager.h's RegisterObject.
+    HeapFile(ObjectId object_id, BufferPool* buffer_pool);
 
     RID Insert(const std::string& row_bytes);
+
+    // Returns the row's bytes at `rid`, or std::nullopt if `rid` doesn't
+    // currently name a live row (unknown page, out-of-range slot, or
+    // already-deleted slot -- the same "not found" cases Delete below
+    // already distinguishes). Added in Phase 5 (docs/DECISIONS.md D-048)
+    // for the executor's index-scan access path: a BPlusTree::Search
+    // returns RIDs, and this is the only way to turn one back into an
+    // actual row's bytes -- Scan()/Find() alone can't do it, since
+    // neither takes a specific RID to look up.
+    std::optional<std::string> GetRow(RID rid) const;
 
     // Returns every live row as (RID, bytes) pairs. Order is page id then
     // slot id — not any particular logical order beyond that.
@@ -82,6 +104,7 @@ class HeapFile {
     size_t NumRows() const;
 
  private:
+    ObjectId object_id_;
     BufferPool* buffer_pool_;
     std::vector<PageId> page_ids_;
     mutable std::mutex page_ids_mutex_;

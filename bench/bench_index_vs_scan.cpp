@@ -52,11 +52,11 @@ int main(int argc, char** argv) {
     {
         DiskManager heap_dm(heap_path);
         BufferPool heap_bp(&heap_dm);
-        HeapFile heap(&heap_bp);
+        HeapFile heap(0, &heap_bp);
 
         DiskManager index_dm(index_path);
         BufferPool index_bp(&index_dm);
-        BPlusTree tree(&index_bp);
+        BPlusTree tree(0, &index_bp);
 
         std::mt19937 gen(seed);
         std::vector<int64_t> keys(n);

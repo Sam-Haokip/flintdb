@@ -71,9 +71,9 @@ constexpr auto kTimeout = std::chrono::milliseconds(5000);
 
 FLINTDB_TEST(lock_manager_multiple_shared_holders_are_compatible) {
     LockManager lm;
-    lm.AcquireLock(1, 100, LockMode::kShared);
-    lm.AcquireLock(2, 100, LockMode::kShared);
-    lm.AcquireLock(3, 100, LockMode::kShared);  // none of these should block or throw
+    lm.AcquireLock(1, 0, 100, LockMode::kShared);
+    lm.AcquireLock(2, 0, 100, LockMode::kShared);
+    lm.AcquireLock(3, 0, 100, LockMode::kShared);  // none of these should block or throw
     FLINTDB_CHECK(lm.HasAnyLock(1));
     FLINTDB_CHECK(lm.HasAnyLock(2));
     FLINTDB_CHECK(lm.HasAnyLock(3));
@@ -81,18 +81,18 @@ FLINTDB_TEST(lock_manager_multiple_shared_holders_are_compatible) {
 
 FLINTDB_TEST(lock_manager_reacquiring_an_already_sufficient_lock_is_a_no_op) {
     LockManager lm;
-    lm.AcquireLock(1, 100, LockMode::kShared);
-    lm.AcquireLock(1, 100, LockMode::kShared);  // same mode again -- must not throw or block
-    lm.AcquireLock(1, 100, LockMode::kExclusive);
-    lm.AcquireLock(1, 100, LockMode::kExclusive);  // exclusive again -- also fine
-    lm.AcquireLock(1, 100, LockMode::kShared);     // shared is already implied by exclusive -- fine
+    lm.AcquireLock(1, 0, 100, LockMode::kShared);
+    lm.AcquireLock(1, 0, 100, LockMode::kShared);  // same mode again -- must not throw or block
+    lm.AcquireLock(1, 0, 100, LockMode::kExclusive);
+    lm.AcquireLock(1, 0, 100, LockMode::kExclusive);  // exclusive again -- also fine
+    lm.AcquireLock(1, 0, 100, LockMode::kShared);     // shared is already implied by exclusive -- fine
     FLINTDB_CHECK(lm.HasAnyLock(1));
 }
 
 FLINTDB_TEST(lock_manager_upgrade_from_shared_to_exclusive_succeeds_when_sole_holder) {
     LockManager lm;
-    lm.AcquireLock(1, 100, LockMode::kShared);
-    lm.AcquireLock(1, 100, LockMode::kExclusive);  // upgrade -- only holder, must succeed immediately
+    lm.AcquireLock(1, 0, 100, LockMode::kShared);
+    lm.AcquireLock(1, 0, 100, LockMode::kExclusive);  // upgrade -- only holder, must succeed immediately
     FLINTDB_CHECK(lm.HasAnyLock(1));
 }
 
@@ -100,11 +100,11 @@ FLINTDB_TEST(lock_manager_younger_transaction_dies_instead_of_waiting_for_an_old
     LockManager lm;
     TxnId older = 1;
     TxnId younger = 2;
-    lm.AcquireLock(older, 100, LockMode::kExclusive);
+    lm.AcquireLock(older, 0, 100, LockMode::kExclusive);
 
     bool threw = false;
     try {
-        lm.AcquireLock(younger, 100, LockMode::kShared);
+        lm.AcquireLock(younger, 0, 100, LockMode::kShared);
     } catch (const TransactionAbortedException& e) {
         threw = true;
         FLINTDB_CHECK_EQ(e.txn_id, younger);
@@ -117,11 +117,11 @@ FLINTDB_TEST(lock_manager_older_transaction_waits_for_a_younger_holder_then_succ
     LockManager lm;
     TxnId older = 1;
     TxnId younger = 5;
-    lm.AcquireLock(younger, 100, LockMode::kExclusive);
+    lm.AcquireLock(younger, 0, 100, LockMode::kExclusive);
 
     std::atomic<bool> older_acquired{false};
     BackgroundResult task = RunInBackground([&] {
-        lm.AcquireLock(older, 100, LockMode::kExclusive);  // must wait, not die -- older is older
+        lm.AcquireLock(older, 0, 100, LockMode::kExclusive);  // must wait, not die -- older is older
         older_acquired = true;
     });
 
@@ -155,8 +155,8 @@ FLINTDB_TEST(lock_manager_wait_die_prevents_a_real_two_transaction_deadlock) {
     TxnId older = 1;
     TxnId younger = 2;
 
-    lm.AcquireLock(older, 100, LockMode::kExclusive);
-    lm.AcquireLock(younger, 200, LockMode::kExclusive);
+    lm.AcquireLock(older, 0, 100, LockMode::kExclusive);
+    lm.AcquireLock(younger, 0, 200, LockMode::kExclusive);
 
     std::atomic<bool> younger_died{false};
     std::atomic<bool> older_succeeded{false};
@@ -165,7 +165,7 @@ FLINTDB_TEST(lock_manager_wait_die_prevents_a_real_two_transaction_deadlock) {
         try {
             // younger wants page 100, held by older -- younger must
             // die, never wait, per wait-die.
-            lm.AcquireLock(younger, 100, LockMode::kExclusive);
+            lm.AcquireLock(younger, 0, 100, LockMode::kExclusive);
         } catch (const TransactionAbortedException& e) {
             FLINTDB_CHECK_EQ(e.txn_id, younger);
             younger_died = true;
@@ -177,7 +177,7 @@ FLINTDB_TEST(lock_manager_wait_die_prevents_a_real_two_transaction_deadlock) {
         // older wants page 200, held by younger -- older is allowed
         // to wait, and must eventually succeed once younger's abort
         // releases page 200.
-        lm.AcquireLock(older, 200, LockMode::kExclusive);
+        lm.AcquireLock(older, 0, 200, LockMode::kExclusive);
         older_succeeded = true;
     });
 
@@ -192,16 +192,16 @@ FLINTDB_TEST(lock_manager_wait_die_prevents_a_real_two_transaction_deadlock) {
 
 FLINTDB_TEST(lock_manager_release_all_frees_every_page_the_transaction_held) {
     LockManager lm;
-    lm.AcquireLock(1, 100, LockMode::kShared);
-    lm.AcquireLock(1, 200, LockMode::kExclusive);
+    lm.AcquireLock(1, 0, 100, LockMode::kShared);
+    lm.AcquireLock(1, 0, 200, LockMode::kExclusive);
     FLINTDB_CHECK(lm.HasAnyLock(1));
 
     lm.ReleaseAll(1);
     FLINTDB_CHECK(!lm.HasAnyLock(1));
 
     // Both pages must now be free for someone else to take exclusively.
-    lm.AcquireLock(2, 100, LockMode::kExclusive);
-    lm.AcquireLock(2, 200, LockMode::kExclusive);
+    lm.AcquireLock(2, 0, 100, LockMode::kExclusive);
+    lm.AcquireLock(2, 0, 200, LockMode::kExclusive);
     FLINTDB_CHECK(lm.HasAnyLock(2));
 }
 
@@ -237,7 +237,7 @@ FLINTDB_TEST(lock_manager_page_level_grants_concurrent_access_to_different_pages
         threads.emplace_back([&, t] {
             TxnId txn_id = static_cast<TxnId>(t + 1);
             PageId page_id = static_cast<PageId>(100 * (t + 1));  // a distinct page per thread -- no two conflict
-            lm.AcquireLock(txn_id, page_id, LockMode::kExclusive);
+            lm.AcquireLock(txn_id, 0, page_id, LockMode::kExclusive);
             got_lock[static_cast<size_t>(t)] = 1;
 
             all_acquired.count_down();
@@ -253,6 +253,41 @@ FLINTDB_TEST(lock_manager_page_level_grants_concurrent_access_to_different_pages
     }
 }
 
+FLINTDB_TEST(lock_manager_the_same_page_id_under_different_object_ids_never_conflicts) {
+    // Phase 5's whole reason PageKey exists (docs/DECISIONS.md D-032): a
+    // bare PageId is only unique within one object's (table's or index's)
+    // own file, so two different objects' page 100 must be treated as two
+    // completely unrelated locks -- one transaction holding page 100
+    // exclusively in object 1 must never block, or even be seen as
+    // related to, a different transaction wanting page 100 in object 2.
+    LockManager lm;
+    TxnId t1 = 1, t2 = 2;
+    ObjectId object1 = 1, object2 = 2;
+
+    // Same numeric page id, different objects -- both exclusive, both
+    // granted immediately, no blocking, no exception.
+    lm.AcquireLock(t1, object1, 100, LockMode::kExclusive);
+    lm.AcquireLock(t2, object2, 100, LockMode::kExclusive);
+
+    FLINTDB_CHECK(lm.HasAnyLock(t1));
+    FLINTDB_CHECK(lm.HasAnyLock(t2));
+
+    // A third, younger transaction can still get object2's page 100
+    // exclusively once t2 releases -- proving the two objects' page-100
+    // locks are tracked as genuinely separate entries, not merged into
+    // one that ReleaseAll(t2) only partially frees.
+    lm.ReleaseAll(t2);
+    TxnId t3 = 3;
+    lm.AcquireLock(t3, object2, 100, LockMode::kExclusive);
+    FLINTDB_CHECK(lm.HasAnyLock(t3));
+
+    // And t1's object1/page-100 lock was never touched by any of this.
+    FLINTDB_CHECK(lm.HasAnyLock(t1));
+
+    lm.ReleaseAll(t1);
+    lm.ReleaseAll(t3);
+}
+
 FLINTDB_TEST(lock_manager_exclusive_lock_blocks_a_younger_reader_until_released) {
     // Same shape as the writer-waits-for-writer test above, but checks
     // shared-vs-exclusive conflict specifically, with the requester
@@ -263,11 +298,11 @@ FLINTDB_TEST(lock_manager_exclusive_lock_blocks_a_younger_reader_until_released)
     LockManager lm;
     TxnId older_writer = 1;
     TxnId younger_reader = 2;
-    lm.AcquireLock(older_writer, 100, LockMode::kExclusive);
+    lm.AcquireLock(older_writer, 0, 100, LockMode::kExclusive);
 
     bool threw = false;
     try {
-        lm.AcquireLock(younger_reader, 100, LockMode::kShared);
+        lm.AcquireLock(younger_reader, 0, 100, LockMode::kShared);
     } catch (const TransactionAbortedException&) {
         threw = true;
     }

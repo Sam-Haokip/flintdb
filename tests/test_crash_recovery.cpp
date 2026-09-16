@@ -42,7 +42,7 @@ FLINTDB_TEST(crash_mid_commit_record_write_leaves_the_transaction_uncommitted) {
         DiskManager dm(db_tmp.path());
         BufferPool bp(&dm);
         LogManager log(wal_tmp.path());
-        HeapFile heap(&bp);
+        HeapFile heap(0, &bp);
 
         // Do exactly what TransactionManager::Commit does, but stop
         // right before (and during) the Commit record, so the crash can
@@ -52,7 +52,7 @@ FLINTDB_TEST(crash_mid_commit_record_write_leaves_the_transaction_uncommitted) {
         RID rid = heap.Insert("row-that-should-vanish");
         touched_pid = rid.page_id;
         Page* page = bp.FetchPage(touched_pid);
-        log.AppendUpdate(txn_id, touched_pid, page->Data());
+        log.AppendUpdate(txn_id, 0, touched_pid, page->Data());
         log.Flush();  // Begin + Update are durably on disk -- txn_id looks
                        // like it's about to commit, right up until this point
         size_after_update_fsync = FileSizeOf(wal_tmp.path());
@@ -72,11 +72,11 @@ FLINTDB_TEST(crash_mid_commit_record_write_leaves_the_transaction_uncommitted) {
         FLINTDB_CHECK(r.type != LogRecordType::kCommit);  // the torn Commit never counts
     }
 
-    size_t replayed = RunRecovery(records, &dm2);
+    size_t replayed = RunRecovery(records, {{0, &dm2}});
     FLINTDB_CHECK_EQ(replayed, 0u);
 
     BufferPool bp2(&dm2);
-    HeapFile heap2(&bp2);
+    HeapFile heap2(0, &bp2);
     FLINTDB_CHECK_EQ(heap2.NumRows(), 0u);
 }
 
@@ -92,8 +92,9 @@ FLINTDB_TEST(checkpoint_then_crash_before_the_next_checkpoint_still_recovers_eve
         DiskManager dm(db_tmp.path());
         BufferPool bp(&dm);
         LogManager log(wal_tmp.path());
-        TransactionManager txm(&bp, &log);
-        HeapFile heap(&bp);
+        TransactionManager txm(&log);
+        txm.RegisterObject(0, &bp);
+        HeapFile heap(0, &bp);
 
         Transaction* t1 = txm.Begin();
         heap.Insert("before-checkpoint-1");
@@ -120,10 +121,10 @@ FLINTDB_TEST(checkpoint_then_crash_before_the_next_checkpoint_still_recovers_eve
     for (const auto& r : log2.RecordsOnOpen()) {
         FLINTDB_CHECK(r.txn_id != 1u);  // txn 1 (pre-checkpoint) left no trace in the wiped log
     }
-    RunRecovery(log2.RecordsOnOpen(), &dm2);
+    RunRecovery(log2.RecordsOnOpen(), {{0, &dm2}});
 
     BufferPool bp2(&dm2);
-    HeapFile heap2(&bp2);
+    HeapFile heap2(0, &bp2);
     auto rows = heap2.Scan();
     FLINTDB_CHECK_EQ(rows.size(), 3u);
     std::multiset<std::string> expected = {"before-checkpoint-1", "before-checkpoint-2", "after-checkpoint-1"};
@@ -143,8 +144,9 @@ FLINTDB_TEST(full_heap_file_transaction_crash_and_recover_integration) {
         DiskManager dm(db_tmp.path());
         BufferPool bp(&dm);
         LogManager log(wal_tmp.path());
-        TransactionManager txm(&bp, &log);
-        HeapFile heap(&bp);
+        TransactionManager txm(&log);
+        txm.RegisterObject(0, &bp);
+        HeapFile heap(0, &bp);
 
         Transaction* t1 = txm.Begin();
         heap.Insert("alice");
@@ -169,10 +171,10 @@ FLINTDB_TEST(full_heap_file_transaction_crash_and_recover_integration) {
 
     DiskManager dm2(db_tmp.path());
     LogManager log2(wal_tmp.path());
-    RunRecovery(log2.RecordsOnOpen(), &dm2);
+    RunRecovery(log2.RecordsOnOpen(), {{0, &dm2}});
 
     BufferPool bp2(&dm2);
-    HeapFile heap2(&bp2);
+    HeapFile heap2(0, &bp2);
     auto rows = heap2.Scan();
     std::multiset<std::string> expected = {"alice", "carol", "dave"};
     FLINTDB_CHECK(RowContents(rows) == expected);
@@ -192,8 +194,9 @@ FLINTDB_TEST(recovery_is_idempotent_across_a_second_simulated_crash_during_recov
         DiskManager dm(db_tmp.path());
         BufferPool bp(&dm);
         LogManager log(wal_tmp.path());
-        TransactionManager txm(&bp, &log);
-        HeapFile heap(&bp);
+        TransactionManager txm(&log);
+        txm.RegisterObject(0, &bp);
+        HeapFile heap(0, &bp);
 
         Transaction* t1 = txm.Begin();
         heap.Insert("row-1");
@@ -203,14 +206,14 @@ FLINTDB_TEST(recovery_is_idempotent_across_a_second_simulated_crash_during_recov
 
     DiskManager dm2(db_tmp.path());
     LogManager log2(wal_tmp.path());
-    size_t first_replay = RunRecovery(log2.RecordsOnOpen(), &dm2);
+    size_t first_replay = RunRecovery(log2.RecordsOnOpen(), {{0, &dm2}});
     // Simulate recovery itself being interrupted and restarted: just run
     // it again over the same records and DiskManager.
-    size_t second_replay = RunRecovery(log2.RecordsOnOpen(), &dm2);
+    size_t second_replay = RunRecovery(log2.RecordsOnOpen(), {{0, &dm2}});
     FLINTDB_CHECK_EQ(first_replay, second_replay);
 
     BufferPool bp2(&dm2);
-    HeapFile heap2(&bp2);
+    HeapFile heap2(0, &bp2);
     auto rows = heap2.Scan();
     FLINTDB_CHECK_EQ(rows.size(), 2u);
     std::multiset<std::string> expected = {"row-1", "row-2"};

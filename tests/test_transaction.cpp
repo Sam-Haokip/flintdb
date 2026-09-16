@@ -20,8 +20,8 @@ FLINTDB_TEST(transaction_begin_returns_active_transaction_with_increasing_ids) {
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
     FLINTDB_CHECK(!txm.HasActiveTransaction());
     Transaction* t1 = txm.Begin();
     FLINTDB_CHECK(t1 != nullptr);
@@ -41,8 +41,8 @@ FLINTDB_TEST(transaction_begin_while_one_is_active_throws) {
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
     txm.Begin();
     bool threw = false;
     try {
@@ -59,8 +59,8 @@ FLINTDB_TEST(transaction_commit_of_a_non_active_transaction_throws) {
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
     Transaction* t1 = txm.Begin();
     txm.Commit(t1);  // t1 is no longer active
 
@@ -79,8 +79,8 @@ FLINTDB_TEST(transaction_abort_of_a_non_active_transaction_throws) {
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
     Transaction* t1 = txm.Begin();
     txm.Abort(t1);
 
@@ -99,8 +99,8 @@ FLINTDB_TEST(transaction_commit_ends_the_active_transaction) {
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
     Transaction* t1 = txm.Begin();
     txm.Commit(t1);
     FLINTDB_CHECK(!txm.HasActiveTransaction());
@@ -112,8 +112,8 @@ FLINTDB_TEST(transaction_abort_ends_the_active_transaction) {
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
     Transaction* t1 = txm.Begin();
     txm.Abort(t1);
     FLINTDB_CHECK(!txm.HasActiveTransaction());
@@ -125,8 +125,9 @@ FLINTDB_TEST(transaction_commit_logs_update_records_then_a_commit_record_and_flu
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-    HeapFile heap(&bp);
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
+    HeapFile heap(0, &bp);
 
     Transaction* txn = txm.Begin();
     heap.Insert("row-a");
@@ -153,8 +154,8 @@ FLINTDB_TEST(transaction_commit_with_no_dirtied_pages_logs_only_begin_and_commit
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
     Transaction* txn = txm.Begin();
     txm.Commit(txn);  // nothing touched in between
 
@@ -171,8 +172,9 @@ FLINTDB_TEST(transaction_abort_logs_no_update_records_only_begin_and_abort) {
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-    HeapFile heap(&bp);
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
+    HeapFile heap(0, &bp);
 
     Transaction* txn = txm.Begin();
     heap.Insert("will-be-aborted");
@@ -191,8 +193,9 @@ FLINTDB_TEST(transaction_abort_reverts_a_heap_file_insert_so_the_row_is_gone) {
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-    HeapFile heap(&bp);
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
+    HeapFile heap(0, &bp);
 
     Transaction* txn = txm.Begin();
     heap.Insert("row-that-will-not-survive");
@@ -221,8 +224,9 @@ FLINTDB_TEST(transaction_abort_after_a_prior_committed_insert_only_reverts_the_n
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-    HeapFile heap(&bp);
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
+    HeapFile heap(0, &bp);
 
     Transaction* t1 = txm.Begin();
     heap.Insert("committed-row");
@@ -250,8 +254,9 @@ FLINTDB_TEST(transaction_commit_force_flushes_so_the_data_file_is_immediately_co
         BufferPool bp(&dm);
         TempFile wal_tmp("wal");
         LogManager log(wal_tmp.path());
-        TransactionManager txm(&bp, &log);
-        HeapFile heap(&bp);
+        TransactionManager txm(&log);
+        txm.RegisterObject(0, &bp);
+        HeapFile heap(0, &bp);
 
         Transaction* txn = txm.Begin();
         RID rid = heap.Insert("flushed-by-commit");
@@ -280,8 +285,9 @@ FLINTDB_TEST(transaction_commit_survives_a_restart_even_without_an_explicit_buff
         DiskManager dm(db_tmp.path());
         BufferPool bp(&dm);
         LogManager log(wal_tmp.path());
-        TransactionManager txm(&bp, &log);
-        HeapFile heap(&bp);
+        TransactionManager txm(&log);
+        txm.RegisterObject(0, &bp);
+        HeapFile heap(0, &bp);
 
         Transaction* txn = txm.Begin();
         heap.Insert("durable-via-wal-only");
@@ -293,11 +299,11 @@ FLINTDB_TEST(transaction_commit_survives_a_restart_even_without_an_explicit_buff
     // "Restart": brand-new objects over the same on-disk files.
     DiskManager dm2(db_tmp.path());
     LogManager log2(wal_tmp.path());
-    size_t replayed = RunRecovery(log2.RecordsOnOpen(), &dm2);
+    size_t replayed = RunRecovery(log2.RecordsOnOpen(), {{0, &dm2}});
     FLINTDB_CHECK(replayed >= 1u);
 
     BufferPool bp2(&dm2);
-    HeapFile heap2(&bp2);
+    HeapFile heap2(0, &bp2);
     auto rows = heap2.Scan();
     FLINTDB_CHECK_EQ(rows.size(), 1u);
     FLINTDB_CHECK_EQ(rows[0].second, std::string("durable-via-wal-only"));
@@ -314,8 +320,9 @@ FLINTDB_TEST(transaction_never_committed_changes_do_not_survive_a_restart) {
         DiskManager dm(db_tmp.path());
         BufferPool bp(&dm);
         LogManager log(wal_tmp.path());
-        TransactionManager txm(&bp, &log);
-        HeapFile heap(&bp);
+        TransactionManager txm(&log);
+        txm.RegisterObject(0, &bp);
+        HeapFile heap(0, &bp);
 
         txm.Begin();
         heap.Insert("never-committed");
@@ -324,11 +331,11 @@ FLINTDB_TEST(transaction_never_committed_changes_do_not_survive_a_restart) {
 
     DiskManager dm2(db_tmp.path());
     LogManager log2(wal_tmp.path());
-    size_t replayed = RunRecovery(log2.RecordsOnOpen(), &dm2);
+    size_t replayed = RunRecovery(log2.RecordsOnOpen(), {{0, &dm2}});
     FLINTDB_CHECK_EQ(replayed, 0u);
 
     BufferPool bp2(&dm2);
-    HeapFile heap2(&bp2);
+    HeapFile heap2(0, &bp2);
     FLINTDB_CHECK_EQ(heap2.NumRows(), 0u);
 }
 
@@ -357,8 +364,8 @@ FLINTDB_TEST(transaction_manager_multiple_threads_each_have_their_own_active_tra
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
     constexpr int kThreads = 6;
     std::latch all_begun(kThreads);
     std::latch all_checked(kThreads);
@@ -418,8 +425,8 @@ FLINTDB_TEST(transaction_manager_begin_is_per_thread_not_global) {
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
     Transaction* main_txn = txm.Begin();  // main thread now has an active transaction
 
     bool other_thread_succeeded = false;
@@ -455,8 +462,8 @@ FLINTDB_TEST(transaction_manager_commit_from_a_different_thread_than_began_it_th
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
     Transaction* txn = txm.Begin();  // begun on this (main) test thread
 
     bool threw = false;
@@ -492,8 +499,8 @@ FLINTDB_TEST(transaction_manager_concurrent_commits_each_log_a_correctly_ordered
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
     constexpr int kThreads = 8;
     std::vector<TxnId> txn_ids(kThreads, 0);
     std::vector<PageId> page_ids(kThreads, 0);
@@ -546,4 +553,80 @@ FLINTDB_TEST(transaction_manager_concurrent_commits_each_log_a_correctly_ordered
         FLINTDB_CHECK_EQ(page->GetSlotCount(), 1u);
         FLINTDB_CHECK_EQ(page->GetRecord(0), std::string("thread-" + std::to_string(t)));
     }
+}
+
+FLINTDB_TEST(transaction_commit_across_two_registered_objects_writes_each_pages_update_record_with_its_own_object_id_and_flushes_both_files) {
+    // The end-to-end proof of D-031/D-032/D-035: a single transaction that
+    // dirties pages in *two different* registered objects (each its own
+    // file, its own BufferPool, sharing only the LogManager/LockManager)
+    // must, on Commit, (a) log an Update record per dirtied page carrying
+    // that page's *own* object_id -- not some fixed default -- and (b)
+    // force-flush each object's dirtied pages to *that object's own* data
+    // file, never cross-writing into the other object's file. A single
+    // shared Commit record still covers both, since there's still exactly
+    // one WAL.
+    TempFile db_tmp_a;
+    TempFile db_tmp_b;
+    TempFile wal_tmp("wal");
+    DiskManager dm_a(db_tmp_a.path());
+    DiskManager dm_b(db_tmp_b.path());
+    BufferPool bp_a(&dm_a);
+    BufferPool bp_b(&dm_b);
+    LogManager log(wal_tmp.path());
+    TransactionManager txm(&log);
+    constexpr ObjectId kObjectA = 5;
+    constexpr ObjectId kObjectB = 9;
+    txm.RegisterObject(kObjectA, &bp_a);
+    txm.RegisterObject(kObjectB, &bp_b);
+    HeapFile heap_a(kObjectA, &bp_a);
+    HeapFile heap_b(kObjectB, &bp_b);
+
+    Transaction* txn = txm.Begin();
+    RID rid_a = heap_a.Insert("lives-in-object-a");
+    RID rid_b = heap_b.Insert("lives-in-object-b");
+    txm.Commit(txn);
+
+    // The transaction touched both objects, so DirtiedPages() (before
+    // Commit erased the Transaction) can't be inspected directly -- check
+    // the WAL and the two data files instead, which is what actually
+    // matters for correctness.
+    LogManager reopened(wal_tmp.path());
+    const auto& records = reopened.RecordsOnOpen();
+    FLINTDB_CHECK_EQ(records.size(), 4u);  // Begin, two Updates (one per object), one Commit
+    FLINTDB_CHECK(records[0].type == LogRecordType::kBegin);
+    FLINTDB_CHECK(records[3].type == LogRecordType::kCommit);
+
+    bool saw_a = false, saw_b = false;
+    for (size_t i = 1; i + 1 < records.size(); i++) {
+        FLINTDB_CHECK(records[i].type == LogRecordType::kUpdate);
+        if (records[i].object_id == kObjectA) {
+            FLINTDB_CHECK_EQ(records[i].page_id, rid_a.page_id);
+            saw_a = true;
+        } else if (records[i].object_id == kObjectB) {
+            FLINTDB_CHECK_EQ(records[i].page_id, rid_b.page_id);
+            saw_b = true;
+        } else {
+            FLINTDB_CHECK(false);  // an Update record with neither object's id -- misrouted
+        }
+    }
+    FLINTDB_CHECK(saw_a);
+    FLINTDB_CHECK(saw_b);
+
+    // Each row landed durably in *its own* object's file, and only there
+    // -- a fresh BufferPool over object A's file must never see object B's
+    // row, and vice versa (they don't even share a HeapFile, but this
+    // confirms Commit's per-object FlushPages routed correctly rather
+    // than, say, flushing everything to whichever pool happened to be
+    // fetched last).
+    BufferPool bp_a2(&dm_a);
+    HeapFile heap_a2(kObjectA, &bp_a2);
+    auto rows_a = heap_a2.Scan();
+    FLINTDB_CHECK_EQ(rows_a.size(), 1u);
+    FLINTDB_CHECK_EQ(rows_a[0].second, std::string("lives-in-object-a"));
+
+    BufferPool bp_b2(&dm_b);
+    HeapFile heap_b2(kObjectB, &bp_b2);
+    auto rows_b = heap_b2.Scan();
+    FLINTDB_CHECK_EQ(rows_b.size(), 1u);
+    FLINTDB_CHECK_EQ(rows_b[0].second, std::string("lives-in-object-b"));
 }

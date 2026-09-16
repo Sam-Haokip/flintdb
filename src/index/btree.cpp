@@ -45,28 +45,32 @@ void WriteAt(char* buf, size_t off, T v) {
 
 PageType ReadPageType(const char* buf) { return static_cast<PageType>(ReadAt<uint16_t>(buf, kOffPageType)); }
 
-// A synthetic PageId, never actually allocated by DiskManager (real page
-// ids are handed out starting at 0 and only ever grow -- see
-// DiskManager::AllocatePage), reserved purely as a LockManager lock
-// target representing "this BPlusTree's root pointer" as a whole. See
-// btree.h's class comment for why root_page_id_ needs this in addition
-// to plain per-node locking. Distinct from INVALID_PAGE_ID (which means
-// "no page"/absence, e.g. a leaf with no next_leaf) -- this id is never
-// compared against a real page, only ever used as a LockManager key.
-constexpr PageId kRootLockSentinel = INVALID_PAGE_ID - 1;
+// Page 0 of every BPlusTree's own file, reserved (docs/DECISIONS.md
+// D-036) to durably store that tree's root_page_id_ and, doubling as
+// that, to serve as the LockManager lock target representing "this
+// BPlusTree's root pointer" as a whole -- see btree.h's class comment
+// for the full rationale (why root_page_id_ needs a lock beyond plain
+// per-node locking, and why this is a real page rather than a synthetic
+// id as an earlier version of this design used). The BPlusTree
+// constructor guarantees this is always the very first page allocated
+// on a fresh file, so no real leaf/internal node can ever collide with
+// it.
+constexpr PageId kRootHeaderPageId = 0;
 
-// Acquires `mode` on `page_id` through the calling thread's current
-// transaction, if any -- a no-op when GetCurrentTransaction() is
+// Acquires `mode` on (object_id, page_id) through the calling thread's
+// current transaction, if any -- a no-op when GetCurrentTransaction() is
 // nullptr, which is what keeps every pre-Phase-4 non-transactional
 // caller (and every test that calls BPlusTree directly, with no
 // TransactionManager involved) working exactly as before, unlocked.
-void LockPage(PageId page_id, LockMode mode) {
-    if (Transaction* txn = GetCurrentTransaction()) txn->AcquireLock(page_id, mode);
+// Qualified by ObjectId as of Phase 5 (docs/DECISIONS.md D-032), since
+// page_id alone is only unique within this BPlusTree's own file.
+void LockPage(ObjectId object_id, PageId page_id, LockMode mode) {
+    if (Transaction* txn = GetCurrentTransaction()) txn->AcquireLock(object_id, page_id, mode);
 }
 
-// Shorthand for locking the synthetic root sentinel -- see its own
-// comment above and btree.h's class comment for what this protects.
-void LockRoot(LockMode mode) { LockPage(kRootLockSentinel, mode); }
+// Shorthand for locking the root header page -- see its own comment
+// above and btree.h's class comment for what this protects.
+void LockRoot(ObjectId object_id, LockMode mode) { LockPage(object_id, kRootHeaderPageId, mode); }
 
 // Per-entry byte costs, used to compute how many keys fit in one page.
 constexpr size_t kLeafEntrySize = sizeof(int64_t) + sizeof(PageId) + sizeof(SlotId);        // 14
@@ -177,6 +181,24 @@ InternalNode DeserializeInternal(const char* buf) {
     return node;
 }
 
+// The root header page's payload: just root_page_id_, stored right after
+// the shared 16-byte page header (docs/DECISIONS.md D-036). Distinct from
+// SerializeLeaf/SerializeInternal above -- this page is never a tree node,
+// just a durable slot for one PageId -- but it still starts with the same
+// PageId+PageType tag every page kind shares (see common/config.h's
+// PageType comment), tagged kBTreeHeader so nothing generic ever mistakes
+// it for a leaf/internal node.
+constexpr size_t kOffHeaderRootPageId = kBTreeHeaderSize;
+
+void SerializeHeader(PageId root_page_id, char* buf) {
+    std::memset(buf, 0, PAGE_SIZE);
+    WriteAt<PageId>(buf, kOffPageId, kRootHeaderPageId);
+    WriteAt<uint16_t>(buf, kOffPageType, static_cast<uint16_t>(PageType::kBTreeHeader));
+    WriteAt<PageId>(buf, kOffHeaderRootPageId, root_page_id);
+}
+
+PageId DeserializeHeaderRootPageId(const char* buf) { return ReadAt<PageId>(buf, kOffHeaderRootPageId); }
+
 // A split's separator key must not be equal to a key left behind on the
 // other side of it: the routing invariant every lookup relies on
 // (children[i] holds keys in [parent.keys[i-1], parent.keys[i])) demands
@@ -255,37 +277,90 @@ std::optional<size_t> FindRebalanceSplit(const std::vector<int64_t>& keys, size_
 
 }  // namespace
 
-BPlusTree::BPlusTree(BufferPool* buffer_pool) : buffer_pool_(buffer_pool) {}
+BPlusTree::BPlusTree(ObjectId object_id, BufferPool* buffer_pool)
+    : object_id_(object_id), buffer_pool_(buffer_pool) {
+    // No transactional locking needed here, same as HeapFile's
+    // constructor: object construction happens before any other thread
+    // can possibly have a reference to this BPlusTree.
+    if (buffer_pool_->NumPagesOnDisk() == 0) {
+        // Fresh file: reserve page 0 as the header, initialized to "empty
+        // tree" (docs/DECISIONS.md D-036). This is guaranteed to be the
+        // very first page this BPlusTree (or anyone else) ever allocates
+        // on this BufferPool, so DiskManager::AllocatePage is guaranteed
+        // to hand back id 0 -- every real leaf/internal node allocated
+        // afterward is guaranteed *not* to collide with kRootHeaderPageId.
+        PageId header_pid;
+        Page* header_page = buffer_pool_->NewPage(&header_pid);
+        SerializeHeader(INVALID_PAGE_ID, header_page->Data());
+        buffer_pool_->MarkDirty(header_pid);
+        // Force-flush this one page immediately, before returning from the
+        // constructor -- docs/DECISIONS.md D-043. This write happens
+        // outside of any transaction (object creation is always DDL,
+        // D-033), so nothing else will ever flush it on this object's
+        // behalf; left pending, it would get silently folded into
+        // whichever transaction happens to touch this page *next* (e.g.
+        // the very first Insert, via SetRootPageId), and an abort of that
+        // transaction would then revert this page all the way back to
+        // raw, never-written bytes instead of the "empty tree" sentinel
+        // that should always be there. FlushPages (not FlushAll) to name
+        // exactly the one page this call is responsible for, the same
+        // scoping reasoning as D-027.
+        buffer_pool_->FlushPages({header_pid});
+    }
+    // Reopening an existing file: the header page (page 0) is already
+    // there, but nothing needs to happen here -- GetRootPageId() (below)
+    // reads it fresh from buffer_pool_ on every call rather than caching
+    // it in a member at construction time (docs/DECISIONS.md D-042), so
+    // there's nothing to read back eagerly. An earlier version of this
+    // constructor did an eager FetchPage+cache here as the original fix
+    // for D-036's "root pointer never persisted" gap; D-042 replaced that
+    // cache with a live read after finding a case (Transaction::Abort
+    // reverting the header page via BufferPool::DiscardPage) where the
+    // cached copy and the real page content could disagree.
+}
 
 PageId BPlusTree::GetRootPageId() const {
-    std::lock_guard<std::mutex> lock(root_mutex_);
-    return root_page_id_;
+    Page* header_page = buffer_pool_->FetchPage(kRootHeaderPageId);
+    return DeserializeHeaderRootPageId(header_page->Data());
 }
 
 void BPlusTree::SetRootPageId(PageId page_id) {
-    std::lock_guard<std::mutex> lock(root_mutex_);
-    root_page_id_ = page_id;
+    // Persist immediately, via the same MarkDirty path every other page
+    // mutation in this codebase goes through -- this is what makes the
+    // root pointer durable and crash-recoverable via the ordinary
+    // WAL/recovery machinery for free (docs/DECISIONS.md D-036), with no
+    // bespoke persistence mechanism needed, and it's the *only* copy of
+    // this value that exists (docs/DECISIONS.md D-042) -- there is no
+    // separate in-memory field this could leave out of sync. Safe to do
+    // with no BPlusTree-local locking (BufferPool::FetchPage/MarkDirty
+    // are already internally synchronized) because every caller of
+    // SetRootPageId already holds page 0's LockManager lock exclusively
+    // for the whole operation -- see btree.h's class comment.
+    Page* header_page = buffer_pool_->FetchPage(kRootHeaderPageId);
+    SerializeHeader(page_id, header_page->Data());
+    buffer_pool_->MarkDirty(kRootHeaderPageId);
 }
 
 bool BPlusTree::Empty() const {
     // A single-field read with no multi-step traversal to protect from a
-    // concurrent root change -- root_mutex_ alone (memory safety) is
-    // enough here, no need for the transactional sentinel lock too.
+    // concurrent root change -- GetRootPageId()'s own memory safety
+    // (docs/DECISIONS.md D-042) is enough here, no need for the
+    // transactional sentinel lock too.
     return GetRootPageId() == INVALID_PAGE_ID;
 }
 
 size_t BPlusTree::Height() const {
-    LockRoot(LockMode::kShared);
+    LockRoot(object_id_, LockMode::kShared);
     PageId root = GetRootPageId();
     if (root == INVALID_PAGE_ID) return 0;
     size_t h = 1;
     PageId cur = root;
-    LockPage(cur, LockMode::kShared);
+    LockPage(object_id_, cur, LockMode::kShared);
     Page* page = buffer_pool_->FetchPage(cur);
     while (ReadPageType(page->Data()) != PageType::kBTreeLeaf) {
         InternalNode node = DeserializeInternal(page->Data());
         cur = node.children.front();
-        LockPage(cur, LockMode::kShared);
+        LockPage(object_id_, cur, LockMode::kShared);
         page = buffer_pool_->FetchPage(cur);
         h++;
     }
@@ -294,13 +369,13 @@ size_t BPlusTree::Height() const {
 
 std::vector<RID> BPlusTree::Search(int64_t key) const {
     std::vector<RID> results;
-    LockRoot(LockMode::kShared);
+    LockRoot(object_id_, LockMode::kShared);
     PageId root = GetRootPageId();
     if (root == INVALID_PAGE_ID) return results;
 
     PageId cur = root;
     while (true) {
-        LockPage(cur, LockMode::kShared);
+        LockPage(object_id_, cur, LockMode::kShared);
         Page* page = buffer_pool_->FetchPage(cur);
         if (ReadPageType(page->Data()) == PageType::kBTreeLeaf) {
             LeafNode leaf = DeserializeLeaf(page->Data());
@@ -317,17 +392,17 @@ std::vector<RID> BPlusTree::Search(int64_t key) const {
 
 std::vector<std::pair<int64_t, RID>> BPlusTree::RangeScanAll() const {
     std::vector<std::pair<int64_t, RID>> out;
-    LockRoot(LockMode::kShared);
+    LockRoot(object_id_, LockMode::kShared);
     PageId root = GetRootPageId();
     if (root == INVALID_PAGE_ID) return out;
 
     PageId cur = root;
-    LockPage(cur, LockMode::kShared);
+    LockPage(object_id_, cur, LockMode::kShared);
     Page* page = buffer_pool_->FetchPage(cur);
     while (ReadPageType(page->Data()) != PageType::kBTreeLeaf) {
         InternalNode node = DeserializeInternal(page->Data());
         cur = node.children.front();
-        LockPage(cur, LockMode::kShared);
+        LockPage(object_id_, cur, LockMode::kShared);
         page = buffer_pool_->FetchPage(cur);
     }
     // `cur`/`page` are now the leftmost leaf, already locked and fetched.
@@ -336,7 +411,7 @@ std::vector<std::pair<int64_t, RID>> BPlusTree::RangeScanAll() const {
         for (size_t i = 0; i < leaf.keys.size(); i++) out.emplace_back(leaf.keys[i], leaf.values[i]);
         if (leaf.next_leaf == INVALID_PAGE_ID) break;
         cur = leaf.next_leaf;
-        LockPage(cur, LockMode::kShared);
+        LockPage(object_id_, cur, LockMode::kShared);
         page = buffer_pool_->FetchPage(cur);
     }
     return out;
@@ -429,13 +504,13 @@ void BPlusTree::Insert(int64_t key, RID rid) {
     // (on a root split), so it needs the same protection a Delete-side
     // root collapse does -- see btree.h's class comment on
     // kRootLockSentinel.
-    LockRoot(LockMode::kExclusive);
+    LockRoot(object_id_, LockMode::kExclusive);
     PageId root = GetRootPageId();
 
     if (root == INVALID_PAGE_ID) {
         PageId pid;
         Page* page = buffer_pool_->NewPage(&pid);
-        LockPage(pid, LockMode::kExclusive);  // bookkeeping only -- a brand-new page can't conflict with anyone
+        LockPage(object_id_, pid, LockMode::kExclusive);  // bookkeeping only -- a brand-new page can't conflict with anyone
         LeafNode leaf;
         leaf.page_id = pid;
         leaf.keys.push_back(key);
@@ -450,7 +525,7 @@ void BPlusTree::Insert(int64_t key, RID rid) {
     if (split.has_value()) {
         PageId new_root_pid;
         Page* new_root_page = buffer_pool_->NewPage(&new_root_pid);
-        LockPage(new_root_pid, LockMode::kExclusive);
+        LockPage(object_id_, new_root_pid, LockMode::kExclusive);
         InternalNode new_root;
         new_root.page_id = new_root_pid;
         new_root.keys.push_back(split->split_key);
@@ -463,7 +538,7 @@ void BPlusTree::Insert(int64_t key, RID rid) {
 }
 
 std::optional<BPlusTree::SplitResult> BPlusTree::InsertRecursive(PageId page_id, int64_t key, RID rid) {
-    LockPage(page_id, LockMode::kExclusive);
+    LockPage(object_id_, page_id, LockMode::kExclusive);
     Page* page = buffer_pool_->FetchPage(page_id);
 
     if (ReadPageType(page->Data()) == PageType::kBTreeLeaf) {
@@ -486,7 +561,7 @@ std::optional<BPlusTree::SplitResult> BPlusTree::InsertRecursive(PageId page_id,
         LeafNode right;
         PageId right_pid;
         Page* right_page = buffer_pool_->NewPage(&right_pid);
-        LockPage(right_pid, LockMode::kExclusive);  // bookkeeping only -- brand new
+        LockPage(object_id_, right_pid, LockMode::kExclusive);  // bookkeeping only -- brand new
         right.page_id = right_pid;
         right.keys.assign(leaf.keys.begin() + static_cast<long>(mid), leaf.keys.end());
         right.values.assign(leaf.values.begin() + static_cast<long>(mid), leaf.values.end());
@@ -531,7 +606,7 @@ std::optional<BPlusTree::SplitResult> BPlusTree::InsertRecursive(PageId page_id,
     InternalNode right;
     PageId right_pid;
     Page* right_page = buffer_pool_->NewPage(&right_pid);
-    LockPage(right_pid, LockMode::kExclusive);  // bookkeeping only -- brand new
+    LockPage(object_id_, right_pid, LockMode::kExclusive);  // bookkeeping only -- brand new
     right.page_id = right_pid;
     right.keys.assign(node.keys.begin() + static_cast<long>(mid) + 1, node.keys.end());
     right.children.assign(node.children.begin() + static_cast<long>(mid) + 1, node.children.end());
@@ -550,7 +625,7 @@ std::optional<BPlusTree::SplitResult> BPlusTree::InsertRecursive(PageId page_id,
 bool BPlusTree::Delete(int64_t key, RID rid) {
     // Exclusive on the whole operation: Delete may replace root_page_id_
     // on a root collapse -- see btree.h's class comment.
-    LockRoot(LockMode::kExclusive);
+    LockRoot(object_id_, LockMode::kExclusive);
     PageId root = GetRootPageId();
     if (root == INVALID_PAGE_ID) return false;
 
@@ -578,7 +653,7 @@ bool BPlusTree::Delete(int64_t key, RID rid) {
 }
 
 BPlusTree::DeleteResult BPlusTree::DeleteRecursive(PageId page_id, bool is_root, int64_t key, RID rid) {
-    LockPage(page_id, LockMode::kExclusive);
+    LockPage(object_id_, page_id, LockMode::kExclusive);
     Page* page = buffer_pool_->FetchPage(page_id);
 
     if (ReadPageType(page->Data()) == PageType::kBTreeLeaf) {
@@ -623,7 +698,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
     // page id is exactly the one it just finished processing) -- calling
     // LockPage again is a harmless no-op, kept for clarity that this
     // function's own contract requires it regardless of caller.
-    LockPage(child_pid, LockMode::kExclusive);
+    LockPage(object_id_, child_pid, LockMode::kExclusive);
     Page* child_page = buffer_pool_->FetchPage(child_pid);
     bool has_left = idx > 0;
     bool has_right = idx + 1 < parent.children.size();
@@ -648,7 +723,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
         // kLeafMinKeys). A non-root node always has at least one sibling,
         // so exactly one of the two blocks below runs.
         if (has_left) {
-            LockPage(parent.children[idx - 1], LockMode::kExclusive);
+            LockPage(object_id_, parent.children[idx - 1], LockMode::kExclusive);
             Page* left_page = buffer_pool_->FetchPage(parent.children[idx - 1]);
             LeafNode left = DeserializeLeaf(left_page->Data());
             size_t combined_size = left.keys.size() + child.keys.size();
@@ -693,7 +768,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
             return;
         }
 
-        LockPage(parent.children[idx + 1], LockMode::kExclusive);
+        LockPage(object_id_, parent.children[idx + 1], LockMode::kExclusive);
         Page* right_page = buffer_pool_->FetchPage(parent.children[idx + 1]);
         LeafNode right = DeserializeLeaf(right_page->Data());
         size_t combined_size = child.keys.size() + right.keys.size();
@@ -747,7 +822,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
     InternalNode child = DeserializeInternal(child_page->Data());
 
     if (has_left) {
-        LockPage(parent.children[idx - 1], LockMode::kExclusive);
+        LockPage(object_id_, parent.children[idx - 1], LockMode::kExclusive);
         Page* left_page = buffer_pool_->FetchPage(parent.children[idx - 1]);
         InternalNode left = DeserializeInternal(left_page->Data());
         if (left.keys.size() > kInternalMinKeys) {
@@ -767,7 +842,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
         }
     }
     if (has_right) {
-        LockPage(parent.children[idx + 1], LockMode::kExclusive);
+        LockPage(object_id_, parent.children[idx + 1], LockMode::kExclusive);
         Page* right_page = buffer_pool_->FetchPage(parent.children[idx + 1]);
         InternalNode right = DeserializeInternal(right_page->Data());
         if (right.keys.size() > kInternalMinKeys) {
@@ -794,7 +869,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
     // get here when neither sibling had spare capacity to redistribute
     // from, so combined size <= 2*kInternalMinKeys < kInternalMaxKeys.
     if (has_left) {
-        LockPage(parent.children[idx - 1], LockMode::kExclusive);
+        LockPage(object_id_, parent.children[idx - 1], LockMode::kExclusive);
         Page* left_page = buffer_pool_->FetchPage(parent.children[idx - 1]);
         InternalNode left = DeserializeInternal(left_page->Data());
         left.keys.push_back(parent.keys[idx - 1]);
@@ -805,7 +880,7 @@ void BPlusTree::FixUnderflow(InternalNode& parent, size_t idx) {
         parent.keys.erase(parent.keys.begin() + static_cast<long>(idx) - 1);
         parent.children.erase(parent.children.begin() + static_cast<long>(idx));
     } else {
-        LockPage(parent.children[idx + 1], LockMode::kExclusive);
+        LockPage(object_id_, parent.children[idx + 1], LockMode::kExclusive);
         Page* right_page = buffer_pool_->FetchPage(parent.children[idx + 1]);
         InternalNode right = DeserializeInternal(right_page->Data());
         child.keys.push_back(parent.keys[idx]);

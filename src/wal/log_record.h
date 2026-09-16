@@ -39,17 +39,25 @@ enum class LogRecordType : uint8_t {
 // docs/DECISIONS.md D-016 for why physical whole-page logging was chosen
 // over physiological byte-range logging).
 //
-// kBegin/kCommit/kAbort don't use page_id or page_image; those fields are
-// left at their defaults for those record types. Every record type uses
-// this same struct shape rather than a tagged union or per-type subclass,
-// which wastes 4KB per non-update record in memory -- an acceptable
-// tradeoff for how small a real WAL's Begin/Commit/Abort record count is
-// next to its Update record count, and it keeps RunRecovery's replay loop
-// (recovery.h) a single flat switch over one record shape.
+// kBegin/kCommit/kAbort don't use object_id, page_id, or page_image; those
+// fields are left at their defaults for those record types. Every record
+// type uses this same struct shape rather than a tagged union or per-type
+// subclass, which wastes 4KB per non-update record in memory -- an
+// acceptable tradeoff for how small a real WAL's Begin/Commit/Abort record
+// count is next to its Update record count, and it keeps RunRecovery's
+// replay loop (recovery.h) a single flat switch over one record shape.
+//
+// object_id (Phase 5, docs/DECISIONS.md D-032): which table/index's file
+// page_id refers to. A bare page_id is only unique within one object's own
+// file (docs/DECISIONS.md D-031 -- every table/index gets its own
+// DiskManager-backed file), so recovery needs to know which file to replay
+// an Update record's page_id against; RunRecovery takes an
+// ObjectId -> DiskManager* map for exactly this reason (recovery.h).
 struct LogRecord {
     Lsn lsn = 0;
     LogRecordType type = LogRecordType::kBegin;
     TxnId txn_id = 0;
+    ObjectId object_id = INVALID_OBJECT_ID;
     PageId page_id = INVALID_PAGE_ID;
     std::array<char, PAGE_SIZE> page_image{};  // only meaningful for kUpdate
 };

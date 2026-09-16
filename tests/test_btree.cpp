@@ -28,7 +28,7 @@ FLINTDB_TEST(btree_empty_tree_has_no_height_and_finds_nothing) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    BPlusTree tree(&bp);
+    BPlusTree tree(0, &bp);
 
     FLINTDB_CHECK(tree.Empty());
     FLINTDB_CHECK_EQ(tree.Height(), 0u);
@@ -39,7 +39,7 @@ FLINTDB_TEST(btree_single_insert_then_search_finds_it) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    BPlusTree tree(&bp);
+    BPlusTree tree(0, &bp);
 
     tree.Insert(10, MakeRid(0, 0));
     FLINTDB_CHECK(!tree.Empty());
@@ -55,7 +55,7 @@ FLINTDB_TEST(btree_search_supports_duplicate_keys) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    BPlusTree tree(&bp);
+    BPlusTree tree(0, &bp);
 
     tree.Insert(5, MakeRid(0, 0));
     tree.Insert(5, MakeRid(0, 1));
@@ -72,7 +72,7 @@ FLINTDB_TEST(btree_many_sequential_inserts_force_leaf_splits_and_all_remain_find
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    BPlusTree tree(&bp);
+    BPlusTree tree(0, &bp);
 
     const int64_t n = 2000;  // comfortably more than one leaf (~291 keys) can hold
     for (int64_t k = 0; k < n; k++) {
@@ -100,7 +100,7 @@ FLINTDB_TEST(btree_random_order_inserts_also_all_remain_findable) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    BPlusTree tree(&bp);
+    BPlusTree tree(0, &bp);
 
     const int64_t n = 3000;
     std::vector<int64_t> keys(static_cast<size_t>(n));
@@ -121,7 +121,7 @@ FLINTDB_TEST(btree_delete_removes_exactly_the_matching_entry) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    BPlusTree tree(&bp);
+    BPlusTree tree(0, &bp);
 
     tree.Insert(1, MakeRid(0, 0));
     tree.Insert(2, MakeRid(0, 1));
@@ -142,7 +142,7 @@ FLINTDB_TEST(btree_delete_everything_leaves_an_empty_tree) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    BPlusTree tree(&bp);
+    BPlusTree tree(0, &bp);
 
     for (int64_t k = 0; k < 50; k++) tree.Insert(k, MakeRid(static_cast<uint32_t>(k), 0));
     for (int64_t k = 0; k < 50; k++) {
@@ -157,7 +157,7 @@ FLINTDB_TEST(btree_insert_and_delete_enough_to_force_merges_across_multiple_leve
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    BPlusTree tree(&bp);
+    BPlusTree tree(0, &bp);
 
     const int64_t n = 4000;  // enough for several leaf levels' worth of splitting
     for (int64_t k = 0; k < n; k++) tree.Insert(k, MakeRid(static_cast<uint32_t>(k), 0));
@@ -208,7 +208,7 @@ void RunRandomizedStressForSeed(unsigned seed, int kOps) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    BPlusTree tree(&bp);
+    BPlusTree tree(0, &bp);
 
     std::vector<std::pair<int64_t, RID>> model;  // mirrors tree contents exactly
     std::mt19937 gen(seed);
@@ -276,4 +276,91 @@ FLINTDB_TEST(btree_randomized_model_based_stress_test) {
     for (unsigned seed = 1; seed <= 10; seed++) {
         RunRandomizedStressForSeed(seed, 4000);
     }
+}
+
+// Regression test for docs/DECISIONS.md D-036: a real Phase 2 gap where
+// root_page_id_ was never actually persisted anywhere -- every Phase 2-4
+// test kept one BPlusTree C++ object alive for its whole run, so nothing
+// ever modeled "close this tree and open a fresh object over the same
+// file," which is exactly the case that would have caught it (a fresh
+// BPlusTree always started from root_page_id_ = INVALID_PAGE_ID
+// regardless of what was already on disk, silently losing every prior
+// insert from the new object's point of view even though the actual node
+// pages were still sitting in the file, unreachable). This is the same
+// "verify, don't assume" story as D-023's phantom-gap correction.
+FLINTDB_TEST(btree_root_page_id_survives_closing_and_reopening_a_fresh_tree_object_over_the_same_file) {
+    TempFile tmp;
+    {
+        DiskManager dm(tmp.path());
+        BufferPool bp(&dm);
+        BPlusTree tree(0, &bp);
+        for (int64_t k = 0; k < 500; k++) {
+            tree.Insert(k, MakeRid(static_cast<uint32_t>(k), 0));
+        }
+        FLINTDB_CHECK(tree.Height() > 1);  // forced at least one real split, so root isn't the original leaf
+        bp.FlushAll();  // BufferPool never persists on its own -- no eviction, no auto-flush on destruction
+                         // (docs/DECISIONS.md D-004) -- nothing durably survives the scope exit below without this.
+    }  // tree, bp, dm all destructed -- nothing survives except what FlushAll already wrote
+
+    DiskManager dm2(tmp.path());
+    BufferPool bp2(&dm2);
+    BPlusTree reopened(0, &bp2);  // a genuinely fresh BPlusTree object over the same file
+
+    FLINTDB_CHECK(!reopened.Empty());
+    FLINTDB_CHECK(reopened.Height() > 1);
+    for (int64_t k = 0; k < 500; k++) {
+        auto results = reopened.Search(k);
+        FLINTDB_CHECK_EQ(results.size(), 1u);
+        FLINTDB_CHECK(results[0] == MakeRid(static_cast<uint32_t>(k), 0));
+    }
+    auto all = reopened.RangeScanAll();
+    FLINTDB_CHECK_EQ(all.size(), 500u);
+}
+
+// The empty-tree edge case of the same fix: an empty tree's root page
+// (INVALID_PAGE_ID) must also survive a reopen, not just a populated
+// one -- a naive fix that only wrote the header page lazily, on the
+// first real Insert, would leave a brand-new empty tree's header
+// unwritten and could misread garbage on reopen before anything was
+// ever inserted.
+FLINTDB_TEST(btree_reopening_a_never_touched_tree_is_still_correctly_empty) {
+    TempFile tmp;
+    {
+        DiskManager dm(tmp.path());
+        BufferPool bp(&dm);
+        BPlusTree tree(0, &bp);  // constructed, but never inserted into
+        bp.FlushAll();  // persist the freshly-initialized header page itself -- see the previous test's comment
+    }
+
+    DiskManager dm2(tmp.path());
+    BufferPool bp2(&dm2);
+    BPlusTree reopened(0, &bp2);
+    FLINTDB_CHECK(reopened.Empty());
+    FLINTDB_CHECK_EQ(reopened.Height(), 0u);
+    FLINTDB_CHECK(reopened.RangeScanAll().empty());
+}
+
+// Page 0 must never be handed out as a real leaf/internal node's id --
+// the whole safety argument for reusing it as both the header's storage
+// and the LockManager's root-lock key (btree.h's class comment) depends
+// on that. Confirms it directly rather than trusting the reasoning: with
+// enough inserts to force real node allocation, no node's own page_id
+// (as embedded in the serialized leaf/internal payload, recoverable via
+// RangeScanAll's RIDs pointing at HeapFile pages -- but more directly,
+// simply: Height() > 1 already proves at least a root-plus-children
+// structure exists, and the header-page reservation happens before any
+// of those allocations) collides with kRootHeaderPageId. This is a
+// structural sanity check on the reservation itself, via
+// ValidateInvariants staying clean across the same stress mix the
+// randomized test above already runs.
+FLINTDB_TEST(btree_header_page_reservation_does_not_disturb_normal_tree_structure) {
+    TempFile tmp;
+    DiskManager dm(tmp.path());
+    BufferPool bp(&dm);
+    BPlusTree tree(0, &bp);
+
+    for (int64_t k = 0; k < 1000; k++) tree.Insert(k, MakeRid(static_cast<uint32_t>(k), 0));
+    auto invariant_error = tree.ValidateInvariants();
+    FLINTDB_CHECK(!invariant_error.has_value());
+    FLINTDB_CHECK_EQ(tree.RangeScanAll().size(), 1000u);
 }

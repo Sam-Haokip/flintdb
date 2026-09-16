@@ -9,17 +9,19 @@ namespace flintdb {
 
 namespace {
 
-// Acquires `mode` on `page_id` through the calling thread's current
-// transaction, if any -- a no-op when GetCurrentTransaction() is
+// Acquires `mode` on (object_id, page_id) through the calling thread's
+// current transaction, if any -- a no-op when GetCurrentTransaction() is
 // nullptr, preserving every pre-Phase-4, non-transactional caller's
-// behavior exactly. Mirrors btree.cpp's identical helper.
-void LockPage(PageId page_id, LockMode mode) {
-    if (Transaction* txn = GetCurrentTransaction()) txn->AcquireLock(page_id, mode);
+// behavior exactly. Mirrors btree.cpp's identical helper. Qualified by
+// ObjectId as of Phase 5 (docs/DECISIONS.md D-032), since page_id alone
+// is only unique within this HeapFile's own file.
+void LockPage(ObjectId object_id, PageId page_id, LockMode mode) {
+    if (Transaction* txn = GetCurrentTransaction()) txn->AcquireLock(object_id, page_id, mode);
 }
 
 }  // namespace
 
-HeapFile::HeapFile(BufferPool* buffer_pool) : buffer_pool_(buffer_pool) {
+HeapFile::HeapFile(ObjectId object_id, BufferPool* buffer_pool) : object_id_(object_id), buffer_pool_(buffer_pool) {
     // No locking needed: object construction happens before any other
     // thread can possibly have a reference to this HeapFile.
     size_t existing = buffer_pool_->NumPagesOnDisk();
@@ -49,7 +51,7 @@ RID HeapFile::Insert(const std::string& row_bytes) {
         if (have_last) last = page_ids_.back();
     }
     if (have_last) {
-        LockPage(last, LockMode::kExclusive);
+        LockPage(object_id_, last, LockMode::kExclusive);
         Page* page = buffer_pool_->FetchPage(last);
         auto slot = page->InsertRecord(row_bytes);
         if (slot.has_value()) {
@@ -61,7 +63,7 @@ RID HeapFile::Insert(const std::string& row_bytes) {
     // Otherwise allocate a fresh page for it.
     PageId new_pid;
     Page* page = buffer_pool_->NewHeapPage(&new_pid);
-    LockPage(new_pid, LockMode::kExclusive);  // bookkeeping only -- a brand-new page can't conflict with anyone
+    LockPage(object_id_, new_pid, LockMode::kExclusive);  // bookkeeping only -- a brand-new page can't conflict with anyone
     {
         std::lock_guard<std::mutex> lock(page_ids_mutex_);
         page_ids_.push_back(new_pid);
@@ -76,6 +78,23 @@ RID HeapFile::Insert(const std::string& row_bytes) {
     return RID{new_pid, *slot};
 }
 
+std::optional<std::string> HeapFile::GetRow(RID rid) const {
+    bool owns_page;
+    {
+        std::lock_guard<std::mutex> lock(page_ids_mutex_);
+        owns_page = std::find(page_ids_.begin(), page_ids_.end(), rid.page_id) != page_ids_.end();
+    }
+    if (!owns_page) {
+        return std::nullopt;  // not a page this heap file owns
+    }
+    LockPage(object_id_, rid.page_id, LockMode::kShared);
+    Page* page = buffer_pool_->FetchPage(rid.page_id);
+    if (rid.slot_id >= page->GetSlotCount() || page->IsDeleted(rid.slot_id)) {
+        return std::nullopt;
+    }
+    return page->GetRecord(rid.slot_id);
+}
+
 std::vector<std::pair<RID, std::string>> HeapFile::Scan() const {
     std::vector<PageId> page_ids_snapshot;
     {
@@ -85,7 +104,7 @@ std::vector<std::pair<RID, std::string>> HeapFile::Scan() const {
 
     std::vector<std::pair<RID, std::string>> out;
     for (PageId pid : page_ids_snapshot) {
-        LockPage(pid, LockMode::kShared);
+        LockPage(object_id_, pid, LockMode::kShared);
         Page* page = buffer_pool_->FetchPage(pid);
         uint16_t n = page->GetSlotCount();
         for (SlotId s = 0; s < n; s++) {
@@ -106,7 +125,7 @@ std::optional<RID> HeapFile::Find(const std::function<bool(const std::string&)>&
     }
 
     for (PageId pid : page_ids_snapshot) {
-        LockPage(pid, LockMode::kShared);
+        LockPage(object_id_, pid, LockMode::kShared);
         Page* page = buffer_pool_->FetchPage(pid);
         uint16_t n = page->GetSlotCount();
         for (SlotId s = 0; s < n; s++) {
@@ -127,7 +146,7 @@ bool HeapFile::Delete(RID rid) {
     if (!owns_page) {
         return false;  // not a page this heap file owns
     }
-    LockPage(rid.page_id, LockMode::kExclusive);
+    LockPage(object_id_, rid.page_id, LockMode::kExclusive);
     Page* page = buffer_pool_->FetchPage(rid.page_id);
     if (rid.slot_id >= page->GetSlotCount() || page->IsDeleted(rid.slot_id)) {
         return false;

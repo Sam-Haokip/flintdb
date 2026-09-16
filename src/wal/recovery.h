@@ -1,8 +1,10 @@
 #pragma once
+#include "../common/config.h"
 #include "../storage/disk_manager.h"
 #include "log_record.h"
 
 #include <cstddef>
+#include <unordered_map>
 #include <vector>
 
 namespace flintdb {
@@ -55,6 +57,23 @@ namespace flintdb {
 // -- an allocated-but-never-committed page is simply wasted space, never
 // a correctness problem, since nothing indexes a page until a committed
 // transaction says so.
-size_t RunRecovery(const std::vector<LogRecord>& records, DiskManager* disk_manager);
+//
+// `disk_managers_by_object` (Phase 5, docs/DECISIONS.md D-031/D-032): one
+// entry per table/index in the Database being recovered, keyed by the
+// same ObjectId every kUpdate record's object_id refers to -- each
+// object owns its own physical file (D-031), so a page_id alone is only
+// meaningful once paired with the right file. The Database facade builds
+// this map (Catalog -> ObjectId -> DiskManager*) before calling this, and
+// it's expected to already contain an entry for every object_id that can
+// possibly appear in `records`: the Catalog's atomic-rewrite persistence
+// (D-033) is required to be durable before any transaction can touch a
+// newly-created object, so a committed Update record naming an object
+// that isn't in this map indicates real corruption, not a normal race --
+// this throws std::out_of_range in that case rather than silently
+// dropping the record, consistent with this project's fail-loud handling
+// of anything that would otherwise be a silent durability violation (see
+// e.g. LogManager's own std::runtime_error throws).
+size_t RunRecovery(const std::vector<LogRecord>& records,
+                    const std::unordered_map<ObjectId, DiskManager*>& disk_managers_by_object);
 
 }  // namespace flintdb

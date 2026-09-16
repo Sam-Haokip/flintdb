@@ -97,8 +97,9 @@ FLINTDB_TEST(isolation_dirty_read_is_prevented_the_reader_blocks_until_the_write
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-    HeapFile heap(&bp);
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
+    HeapFile heap(0, &bp);
 
     std::atomic<bool> reader_begun{false};
     std::atomic<bool> writer_inserted{false};
@@ -146,8 +147,9 @@ FLINTDB_TEST(isolation_lost_update_is_prevented_by_exclusive_locks_held_through_
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-    HeapFile heap(&bp);
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
+    HeapFile heap(0, &bp);
 
     heap.Insert("counter:0");  // seed row, written with no transaction active
 
@@ -217,8 +219,9 @@ FLINTDB_TEST(isolation_non_repeatable_read_is_prevented_because_the_writer_waits
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-    HeapFile heap(&bp);
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
+    HeapFile heap(0, &bp);
 
     RID seed_rid = heap.Insert("value:0");  // no transaction active yet
 
@@ -288,8 +291,9 @@ FLINTDB_TEST(isolation_phantom_read_is_prevented_when_a_full_scan_has_already_lo
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-    HeapFile heap(&bp);
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
+    HeapFile heap(0, &bp);
 
     heap.Insert("row-1");  // no transaction active yet -- page 0 has room to spare
 
@@ -354,8 +358,9 @@ FLINTDB_TEST(isolation_phantom_read_gap_a_find_that_returns_early_never_locks_th
     DiskManager dm(db_tmp.path());
     BufferPool bp(&dm);
     LogManager log(wal_tmp.path());
-    TransactionManager txm(&bp, &log);
-    HeapFile heap(&bp);
+    TransactionManager txm(&log);
+    txm.RegisterObject(0, &bp);
+    HeapFile heap(0, &bp);
 
     // Build a table with (a) "target" sitting alone on page 0, findable on
     // the very first page Find() ever looks at, and (b) a second,

@@ -51,42 +51,47 @@ class Transaction {
 
     // Called by BufferPool's per-thread transaction observer (wired up in
     // TransactionManager::Begin) every time this transaction's work marks
-    // a page dirty. Recording the same page more than once is harmless --
-    // dirtied_pages_ is a set, and only the page's *final* content at
-    // commit time ends up in the WAL either way (see
-    // TransactionManager::Commit).
-    void NotifyDirty(PageId page_id) { dirtied_pages_.insert(page_id); }
+    // a page dirty. Recording the same (object, page) more than once is
+    // harmless -- dirtied_pages_ is a set, and only the page's *final*
+    // content at commit time ends up in the WAL either way (see
+    // TransactionManager::Commit). Qualified by ObjectId as of Phase 5,
+    // since a transaction can dirty pages across more than one table/index
+    // in the same Database (docs/DECISIONS.md D-032) and each is only
+    // fetchable through *that* object's own BufferPool.
+    void NotifyDirty(ObjectId object_id, PageId page_id) { dirtied_pages_.insert(PageKey{object_id, page_id}); }
 
-    // Every page this transaction has dirtied so far, in page-id order.
-    // Order isn't load-bearing for correctness (each Update record names
-    // its own page_id), but a deterministic iteration order keeps tests
-    // and any future debug logging reproducible for free.
-    const std::set<PageId>& DirtiedPages() const { return dirtied_pages_; }
+    // Every (object, page) this transaction has dirtied so far, in sorted
+    // order. Order isn't load-bearing for correctness (each Update record
+    // names its own object_id/page_id), but a deterministic iteration
+    // order keeps tests and any future debug logging reproducible for
+    // free.
+    const std::set<PageKey>& DirtiedPages() const { return dirtied_pages_; }
 
-    // Acquires `mode` on `page_id` through this transaction's shared
-    // LockManager, on behalf of this transaction's id -- the Strict 2PL
-    // entry point every page-touching HeapFile/BTree call site goes
-    // through once locking is wired in (see GetCurrentTransaction()
-    // below and docs/SPEC.md section 3). Blocks per wait-die, or throws
-    // TransactionAbortedException if this transaction is chosen as the
-    // victim (see lock_manager.h) -- callers are expected to let that
-    // propagate up to whoever is driving the transaction, which must
-    // catch it and call TransactionManager::Abort rather than continue
-    // using a transaction that just lost a lock request it needed.
+    // Acquires `mode` on `page_id` (within `object_id`'s own file) through
+    // this transaction's shared LockManager, on behalf of this
+    // transaction's id -- the Strict 2PL entry point every page-touching
+    // HeapFile/BTree call site goes through once locking is wired in (see
+    // GetCurrentTransaction() below and docs/SPEC.md section 3). Blocks
+    // per wait-die, or throws TransactionAbortedException if this
+    // transaction is chosen as the victim (see lock_manager.h) -- callers
+    // are expected to let that propagate up to whoever is driving the
+    // transaction, which must catch it and call TransactionManager::Abort
+    // rather than continue using a transaction that just lost a lock
+    // request it needed.
     //
     // A null lock_manager_ (never true for a Transaction TransactionManager
     // constructs, but kept safe for tests that construct one standalone)
     // makes this a no-op, consistent with GetCurrentTransaction()
     // returning nullptr being the "no transaction, no locking" case
     // everywhere else in this design.
-    void AcquireLock(PageId page_id, LockMode mode) {
-        if (lock_manager_) lock_manager_->AcquireLock(txn_id_, page_id, mode);
+    void AcquireLock(ObjectId object_id, PageId page_id, LockMode mode) {
+        if (lock_manager_) lock_manager_->AcquireLock(txn_id_, object_id, page_id, mode);
     }
 
  private:
     TxnId txn_id_;
     LockManager* lock_manager_;
-    std::set<PageId> dirtied_pages_;
+    std::set<PageKey> dirtied_pages_;
 };
 
 // Thread-local "which transaction, if any, is running on this thread"

@@ -6,18 +6,29 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 
 namespace flintdb {
 
 // Coordinates every in-flight transaction's lifecycle against a shared
-// BufferPool, LogManager, and LockManager: Begin() opens one, Commit() or
-// Abort() closes it out. Phase 4 lifts Phase 3's "exactly one active
-// transaction at a time" restriction: multiple transactions, each on its
-// own calling thread (the thread-per-transaction model -- see
-// Transaction's class comment), can be simultaneously active, coordinated
-// through LockManager's Strict 2PL rather than by simply refusing to let
-// more than one exist.
+// LogManager and LockManager, plus a *registry* of per-object BufferPools
+// (see RegisterObject below) -- Begin() opens one, Commit() or Abort()
+// closes it out. Phase 4 lifts Phase 3's "exactly one active transaction
+// at a time" restriction: multiple transactions, each on its own calling
+// thread (the thread-per-transaction model -- see Transaction's class
+// comment), can be simultaneously active, coordinated through
+// LockManager's Strict 2PL rather than by simply refusing to let more
+// than one exist.
+//
+// Phase 5 (docs/DECISIONS.md D-031/D-032/D-035) generalizes "a shared
+// BufferPool" to "a shared LockManager plus one BufferPool *per table or
+// index*", since every table/index now owns its own file (and therefore
+// its own DiskManager+BufferPool). A single transaction can still touch
+// more than one table/index (e.g. an INSERT that also maintains a
+// secondary index), so Commit/Abort/Begin all have to work across every
+// object a transaction dirtied, not just one fixed pool -- see
+// RegisterObject, Begin(), Commit(), and Abort()'s comments below for how.
 //
 // What Phase 4 keeps from Phase 3 is a *per-thread* restriction: a thread
 // may have at most one active transaction of its own at a time (Begin()
@@ -78,17 +89,41 @@ namespace flintdb {
 // meaning transaction age (see lock_manager.h).
 class TransactionManager {
  public:
-    TransactionManager(BufferPool* buffer_pool, LogManager* log_manager);
+    explicit TransactionManager(LogManager* log_manager);
+
+    // Registers `buffer_pool` as the pool backing `object_id` (one table's
+    // or index's file -- docs/DECISIONS.md D-031). Every object a
+    // transaction might ever touch must be registered before that
+    // transaction's Begin() call, so Begin() can set up dirty-page routing
+    // for it (see Begin()'s comment) and Commit()/Abort() can find the
+    // right pool to flush/discard/fetch through for any page a
+    // transaction dirtied there. In practice this is called once per
+    // table/index, when the Database facade opens or creates it (Phase 5)
+    // -- not a per-transaction operation, and (like the Catalog's own
+    // persistence, D-033) only ever expected to happen with no
+    // transaction concurrently active, mirroring D-033's "no concurrent
+    // DDL" precondition.
+    //
+    // Re-registering an already-registered object_id with a different
+    // BufferPool* replaces the old mapping -- not a case this project's
+    // own code ever does, but not worth guarding against either, since a
+    // caller doing that on purpose (e.g. a test rewiring an object to a
+    // fresh pool) gets exactly the behavior its name implies.
+    void RegisterObject(ObjectId object_id, BufferPool* buffer_pool);
 
     // Starts a new transaction, logs a Begin record for it, sets it as
     // this calling thread's current transaction (GetCurrentTransaction(),
-    // transaction.h), and registers it as the buffer pool's
-    // active-transaction observer *for this thread* so every page it
-    // dirties from now on -- through however many HeapFile/B-tree calls
-    // happen in between, on this same thread -- is recorded automatically,
-    // with neither of those layers needing to know a transaction exists.
-    // The returned Transaction* is owned by the TransactionManager and
-    // stays valid until the matching Commit() or Abort() call (which must
+    // transaction.h), and registers a dirty-page observer -- for this
+    // thread -- on *every currently-registered* BufferPool (see
+    // RegisterObject above), each one closing over its own ObjectId so
+    // MarkDirty on any registered pool routes to
+    // txn_ptr->NotifyDirty(that pool's object_id, page_id), with neither
+    // BufferPool nor HeapFile/BTree needing to know a transaction exists.
+    // Every registered pool gets an observer up front, not just the ones
+    // this transaction ends up touching, since which objects a
+    // transaction will dirty isn't known until it's done running. The
+    // returned Transaction* is owned by the TransactionManager and stays
+    // valid until the matching Commit() or Abort() call (which must
     // happen on this same thread -- see Commit()/Abort()'s comments).
     //
     // Throws std::logic_error if the calling thread already has an
@@ -96,23 +131,28 @@ class TransactionManager {
     // threads calling Begin() concurrently is the supported, tested case.
     Transaction* Begin();
 
-    // Logs an Update record (the page's current in-memory content, read
-    // back via BufferPool::FetchPage) for every page `txn` dirtied, then
-    // a Commit record, then calls LogManager::Flush() (fsync -- this is
-    // what actually makes the commit durable) and finally
-    // BufferPool::FlushPages(txn->DirtiedPages()) (the "force" half of
-    // the policy described in the class comment, in that order) --
-    // deliberately FlushPages, scoped to this transaction's own pages,
-    // rather than FlushAll: under Phase 4's real concurrency, FlushAll
-    // would also flush a different, concurrently-active transaction's
-    // still-uncommitted dirty pages, which is a no-steal violation (see
-    // BufferPool::FlushAll's own comment and docs/DECISIONS.md for how
-    // this was caught, during Phase 4 design). Finally releases every
-    // lock `txn` holds via LockManager::ReleaseAll -- only *after* the
-    // flush, which is what makes this Strict 2PL (locks held through
-    // durability, not just through the WAL append) -- clears the buffer
-    // pool's observer and this thread's current-transaction pointer, and
-    // removes `txn` from the active set.
+    // Groups `txn`'s DirtiedPages() by ObjectId (docs/DECISIONS.md D-032)
+    // and, per object, logs an Update record (the page's current
+    // in-memory content, read back via that object's own BufferPool::
+    // FetchPage) for every page dirtied there. Once every object's
+    // updates are logged, appends a single Commit record and calls
+    // LogManager::Flush() (fsync -- this is what actually makes the
+    // commit durable) -- one shared WAL still means one Commit record
+    // covers every object this transaction touched. Finally, per object
+    // again, calls that object's own BufferPool::FlushPages() over just
+    // the pages dirtied *there* (the "force" half of the policy described
+    // in the class comment) -- deliberately FlushPages, scoped to this
+    // transaction's own pages, rather than FlushAll: under Phase 4's real
+    // concurrency, FlushAll would also flush a different, concurrently-
+    // active transaction's still-uncommitted dirty pages, which is a
+    // no-steal violation (see BufferPool::FlushAll's own comment and
+    // docs/DECISIONS.md for how this was caught, during Phase 4 design).
+    // Finally releases every lock `txn` holds via LockManager::ReleaseAll
+    // -- only *after* the flush, which is what makes this Strict 2PL
+    // (locks held through durability, not just through the WAL append) --
+    // clears this thread's observer on *every* registered BufferPool (see
+    // Begin()) and this thread's current-transaction pointer, and removes
+    // `txn` from the active set.
     //
     // `txn` must be this calling thread's current transaction (i.e. the
     // pointer this same thread's own Begin() returned, not yet committed
@@ -124,17 +164,18 @@ class TransactionManager {
     // ever meaningful for the thread that owns them (see transaction.h).
     void Commit(Transaction* txn);
 
-    // Reverts every page `txn` dirtied back to its on-disk content (via
-    // BufferPool::DiscardPage -- safe to do because Commit's force-flush
-    // guarantees the data file always reflects at least "as of the last
-    // commit", see the class comment) and logs a diagnostic Abort record
-    // -- recovery never looks for it, since a transaction with no Commit
-    // record is already correctly ignored either way (see
-    // wal/recovery.h). Releases every lock `txn` holds via
-    // LockManager::ReleaseAll, clears the buffer pool's observer and this
-    // thread's current-transaction pointer, and removes `txn` from the
-    // active set. Same "txn must be this thread's own active transaction"
-    // requirement as Commit.
+    // Groups `txn`'s DirtiedPages() by ObjectId and, per object, reverts
+    // every page dirtied there back to its on-disk content (via that
+    // object's own BufferPool::DiscardPage -- safe to do because Commit's
+    // force-flush guarantees each object's data file always reflects at
+    // least "as of the last commit", see the class comment), then logs a
+    // single diagnostic Abort record -- recovery never looks for it,
+    // since a transaction with no Commit record is already correctly
+    // ignored either way (see wal/recovery.h). Releases every lock `txn`
+    // holds via LockManager::ReleaseAll, clears this thread's observer on
+    // every registered BufferPool, and this thread's current-transaction
+    // pointer, and removes `txn` from the active set. Same "txn must be
+    // this thread's own active transaction" requirement as Commit.
     void Abort(Transaction* txn);
 
     // Whether at least one transaction is currently active, across all
@@ -151,15 +192,31 @@ class TransactionManager {
     size_t NumActiveTransactions() const;
 
  private:
-    BufferPool* buffer_pool_;
+    // Every page a transaction dirties, grouped by which object (table or
+    // index) it belongs to -- the shared helper behind both Commit() and
+    // Abort(), since both need to walk DirtiedPages() one object's worth
+    // at a time (to fetch/discard/flush through the *right* BufferPool)
+    // rather than all at once. PageKey's own operator< already sorts by
+    // object_id first (lock_manager.h), so a single linear pass over the
+    // (already-sorted) std::set<PageKey> suffices -- no re-sorting needed.
+    std::unordered_map<ObjectId, std::set<PageId>> GroupDirtiedPagesByObject(const Transaction* txn) const;
+
     LogManager* log_manager_;
-    // Owned here (composition, not injected like buffer_pool_/log_manager_
-    // above) because a LockManager's lifetime is naturally scoped to "the
-    // set of transactions this TransactionManager coordinates" -- see
-    // lock_manager.h's class comment ("shared by every Transaction in one
-    // TransactionManager's scope") -- and nothing else in the system
-    // needs a reference to it.
+    // Owned here (composition, not injected like log_manager_/the
+    // registered BufferPools above) because a LockManager's lifetime is
+    // naturally scoped to "the set of transactions this TransactionManager
+    // coordinates" -- see lock_manager.h's class comment ("shared by every
+    // Transaction in one TransactionManager's scope") -- and nothing else
+    // in the system needs a reference to it.
     LockManager lock_manager_;
+
+    // One BufferPool per registered table/index (docs/DECISIONS.md
+    // D-031/D-035), keyed by the ObjectId its owner (the Database facade,
+    // Phase 5) assigned it -- see RegisterObject. Not owned here: each
+    // object's BufferPool/DiskManager lifetime belongs to whoever created
+    // the object (the Database facade), matching how log_manager_ is
+    // injected and not owned either.
+    std::unordered_map<ObjectId, BufferPool*> buffer_pools_;
 
     mutable std::mutex mutex_;
     std::unordered_map<TxnId, std::unique_ptr<Transaction>> active_txns_;

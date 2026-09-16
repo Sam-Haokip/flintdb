@@ -14,13 +14,14 @@ namespace flintdb {
 namespace {
 
 // Header layout, matching log_manager.h's doc comment:
-//   lsn:8  type:1  txn_id:8  page_id:4  payload_len:4
+//   lsn:8  type:1  txn_id:8  object_id:4  page_id:4  payload_len:4
 constexpr size_t kOffLsn = 0;
 constexpr size_t kOffType = 8;
 constexpr size_t kOffTxnId = 9;
-constexpr size_t kOffPageId = 17;
-constexpr size_t kOffPayloadLen = 21;
-constexpr size_t kHeaderSize = 25;
+constexpr size_t kOffObjectId = 17;
+constexpr size_t kOffPageId = 21;
+constexpr size_t kOffPayloadLen = 25;
+constexpr size_t kHeaderSize = 29;
 constexpr size_t kChecksumSize = 4;
 
 template <typename T>
@@ -129,6 +130,7 @@ LogManager::LogManager(const std::string& wal_file_path) : fd_(-1), next_lsn_(1)
         Lsn lsn = ReadAt<Lsn>(data.data(), offset + kOffLsn);
         uint8_t raw_type = ReadAt<uint8_t>(data.data(), offset + kOffType);
         TxnId txn_id = ReadAt<TxnId>(data.data(), offset + kOffTxnId);
+        ObjectId object_id = ReadAt<ObjectId>(data.data(), offset + kOffObjectId);
         PageId page_id = ReadAt<PageId>(data.data(), offset + kOffPageId);
         uint32_t payload_len = ReadAt<uint32_t>(data.data(), offset + kOffPayloadLen);
 
@@ -147,6 +149,7 @@ LogManager::LogManager(const std::string& wal_file_path) : fd_(-1), next_lsn_(1)
         record.lsn = lsn;
         record.type = type;
         record.txn_id = txn_id;
+        record.object_id = object_id;
         record.page_id = page_id;
         if (payload_len > 0) {
             std::memcpy(record.page_image.data(), data.data() + offset + kHeaderSize, payload_len);
@@ -180,8 +183,8 @@ LogManager::~LogManager() {
 
 const std::vector<LogRecord>& LogManager::RecordsOnOpen() const { return records_on_open_; }
 
-Lsn LogManager::AppendRecord(LogRecordType type, TxnId txn_id, PageId page_id, const char* payload,
-                              uint32_t payload_len) {
+Lsn LogManager::AppendRecord(LogRecordType type, TxnId txn_id, ObjectId object_id, PageId page_id,
+                              const char* payload, uint32_t payload_len) {
     // Held across LSN assignment *and* the physical write() -- see the
     // class comment for why both have to be inside one critical section,
     // not just the counter increment.
@@ -192,6 +195,7 @@ Lsn LogManager::AppendRecord(LogRecordType type, TxnId txn_id, PageId page_id, c
     WriteAt<Lsn>(buf.data(), kOffLsn, lsn);
     WriteAt<uint8_t>(buf.data(), kOffType, static_cast<uint8_t>(type));
     WriteAt<TxnId>(buf.data(), kOffTxnId, txn_id);
+    WriteAt<ObjectId>(buf.data(), kOffObjectId, object_id);
     WriteAt<PageId>(buf.data(), kOffPageId, page_id);
     WriteAt<uint32_t>(buf.data(), kOffPayloadLen, payload_len);
     if (payload_len > 0) {
@@ -205,19 +209,20 @@ Lsn LogManager::AppendRecord(LogRecordType type, TxnId txn_id, PageId page_id, c
 }
 
 Lsn LogManager::AppendBegin(TxnId txn_id) {
-    return AppendRecord(LogRecordType::kBegin, txn_id, INVALID_PAGE_ID, nullptr, 0);
+    return AppendRecord(LogRecordType::kBegin, txn_id, INVALID_OBJECT_ID, INVALID_PAGE_ID, nullptr, 0);
 }
 
-Lsn LogManager::AppendUpdate(TxnId txn_id, PageId page_id, const char* page_image) {
-    return AppendRecord(LogRecordType::kUpdate, txn_id, page_id, page_image, static_cast<uint32_t>(PAGE_SIZE));
+Lsn LogManager::AppendUpdate(TxnId txn_id, ObjectId object_id, PageId page_id, const char* page_image) {
+    return AppendRecord(LogRecordType::kUpdate, txn_id, object_id, page_id, page_image,
+                         static_cast<uint32_t>(PAGE_SIZE));
 }
 
 Lsn LogManager::AppendCommit(TxnId txn_id) {
-    return AppendRecord(LogRecordType::kCommit, txn_id, INVALID_PAGE_ID, nullptr, 0);
+    return AppendRecord(LogRecordType::kCommit, txn_id, INVALID_OBJECT_ID, INVALID_PAGE_ID, nullptr, 0);
 }
 
 Lsn LogManager::AppendAbort(TxnId txn_id) {
-    return AppendRecord(LogRecordType::kAbort, txn_id, INVALID_PAGE_ID, nullptr, 0);
+    return AppendRecord(LogRecordType::kAbort, txn_id, INVALID_OBJECT_ID, INVALID_PAGE_ID, nullptr, 0);
 }
 
 void LogManager::Flush() {

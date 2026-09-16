@@ -14,11 +14,12 @@ std::array<char, PAGE_SIZE> MakePageImage(char fill) {
     return img;
 }
 
-LogRecord MakeUpdate(Lsn lsn, TxnId txn_id, PageId page_id, char fill) {
+LogRecord MakeUpdate(Lsn lsn, TxnId txn_id, PageId page_id, char fill, ObjectId object_id = 0) {
     LogRecord r;
     r.lsn = lsn;
     r.type = LogRecordType::kUpdate;
     r.txn_id = txn_id;
+    r.object_id = object_id;
     r.page_id = page_id;
     r.page_image = MakePageImage(fill);
     return r;
@@ -53,7 +54,7 @@ LogRecord MakeAbort(Lsn lsn, TxnId txn_id) {
 FLINTDB_TEST(recovery_of_empty_log_is_a_no_op) {
     TempFile tmp;
     DiskManager dm(tmp.path());
-    size_t replayed = RunRecovery({}, &dm);
+    size_t replayed = RunRecovery({}, {{0, &dm}});
     FLINTDB_CHECK_EQ(replayed, 0u);
 }
 
@@ -67,7 +68,7 @@ FLINTDB_TEST(recovery_replays_a_committed_transactions_update) {
         MakeUpdate(2, 100, pid, 'X'),
         MakeCommit(3, 100),
     };
-    size_t replayed = RunRecovery(records, &dm);
+    size_t replayed = RunRecovery(records, {{0, &dm}});
     FLINTDB_CHECK_EQ(replayed, 1u);
 
     auto expected = MakePageImage('X');
@@ -89,7 +90,7 @@ FLINTDB_TEST(recovery_skips_updates_for_a_transaction_with_no_commit_record) {
         MakeUpdate(2, 200, pid, 'Y'),
         // crash before Commit -- no commit record for txn 200
     };
-    size_t replayed = RunRecovery(records, &dm);
+    size_t replayed = RunRecovery(records, {{0, &dm}});
     FLINTDB_CHECK_EQ(replayed, 0u);
 
     std::array<char, PAGE_SIZE> actual;
@@ -114,7 +115,7 @@ FLINTDB_TEST(recovery_skips_an_aborted_transaction_even_if_it_somehow_had_update
         MakeUpdate(2, 300, pid, 'Z'),
         MakeAbort(3, 300),
     };
-    size_t replayed = RunRecovery(records, &dm);
+    size_t replayed = RunRecovery(records, {{0, &dm}});
     FLINTDB_CHECK_EQ(replayed, 0u);
 
     std::array<char, PAGE_SIZE> actual;
@@ -136,7 +137,7 @@ FLINTDB_TEST(recovery_applies_committed_updates_from_multiple_interleaved_transa
         MakeCommit(5, 1),
         // txn 2 never commits
     };
-    size_t replayed = RunRecovery(records, &dm);
+    size_t replayed = RunRecovery(records, {{0, &dm}});
     FLINTDB_CHECK_EQ(replayed, 1u);
 
     auto expected_a = MakePageImage('A');
@@ -164,7 +165,7 @@ FLINTDB_TEST(recovery_of_multiple_updates_to_the_same_page_applies_them_in_lsn_o
         MakeUpdate(3, 2, pid, 'B'),
         MakeCommit(4, 2),
     };
-    size_t replayed = RunRecovery(records, &dm);
+    size_t replayed = RunRecovery(records, {{0, &dm}});
     FLINTDB_CHECK_EQ(replayed, 2u);
 
     auto expected = MakePageImage('B');
@@ -182,8 +183,8 @@ FLINTDB_TEST(recovery_is_idempotent_when_run_twice_over_the_same_records) {
         MakeUpdate(1, 1, pid, 'Q'),
         MakeCommit(2, 1),
     };
-    RunRecovery(records, &dm);
-    size_t replayed_again = RunRecovery(records, &dm);
+    RunRecovery(records, {{0, &dm}});
+    size_t replayed_again = RunRecovery(records, {{0, &dm}});
     // Idempotent means "produces the same on-disk result", not "detects
     // and skips a repeat" -- recovery has no way to know it already ran,
     // and doesn't need to: writing the same bytes twice is harmless.
@@ -193,4 +194,43 @@ FLINTDB_TEST(recovery_is_idempotent_when_run_twice_over_the_same_records) {
     std::array<char, PAGE_SIZE> actual;
     dm.ReadPage(pid, actual.data());
     FLINTDB_CHECK(actual == expected);
+}
+
+FLINTDB_TEST(recovery_replays_committed_updates_against_the_right_object_when_object_ids_share_a_page_id) {
+    // Phase 5, docs/DECISIONS.md D-031/D-032: once every table/index gets
+    // its own file, a bare page_id is not enough to know which file a
+    // committed Update record belongs to -- this is the whole reason
+    // RunRecovery takes an ObjectId -> DiskManager* map instead of a
+    // single DiskManager*. Two different objects allocate the *same*
+    // numeric page_id (0, since each is a fresh, separately-numbered
+    // file) and each object's committed update must land only in its own
+    // file, never cross over into the other's.
+    TempFile tmp_a;
+    TempFile tmp_b;
+    DiskManager dm_a(tmp_a.path());
+    DiskManager dm_b(tmp_b.path());
+    PageId pid_a = dm_a.AllocatePage();
+    PageId pid_b = dm_b.AllocatePage();
+    FLINTDB_CHECK_EQ(pid_a, pid_b);  // same page_id, different objects/files
+
+    constexpr ObjectId kObjectA = 11;
+    constexpr ObjectId kObjectB = 22;
+    std::vector<LogRecord> records = {
+        MakeUpdate(1, 1, pid_a, 'A', kObjectA),
+        MakeUpdate(2, 2, pid_b, 'B', kObjectB),
+        MakeCommit(3, 1),
+        MakeCommit(4, 2),
+    };
+    size_t replayed = RunRecovery(records, {{kObjectA, &dm_a}, {kObjectB, &dm_b}});
+    FLINTDB_CHECK_EQ(replayed, 2u);
+
+    auto expected_a = MakePageImage('A');
+    std::array<char, PAGE_SIZE> actual_a;
+    dm_a.ReadPage(pid_a, actual_a.data());
+    FLINTDB_CHECK(actual_a == expected_a);
+
+    auto expected_b = MakePageImage('B');
+    std::array<char, PAGE_SIZE> actual_b;
+    dm_b.ReadPage(pid_b, actual_b.data());
+    FLINTDB_CHECK(actual_b == expected_b);
 }

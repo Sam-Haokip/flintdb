@@ -4,8 +4,21 @@
 
 namespace flintdb {
 
-TransactionManager::TransactionManager(BufferPool* buffer_pool, LogManager* log_manager)
-    : buffer_pool_(buffer_pool), log_manager_(log_manager) {}
+TransactionManager::TransactionManager(LogManager* log_manager) : log_manager_(log_manager) {}
+
+void TransactionManager::RegisterObject(ObjectId object_id, BufferPool* buffer_pool) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    buffer_pools_[object_id] = buffer_pool;
+}
+
+std::unordered_map<ObjectId, std::set<PageId>> TransactionManager::GroupDirtiedPagesByObject(
+    const Transaction* txn) const {
+    std::unordered_map<ObjectId, std::set<PageId>> by_object;
+    for (const PageKey& key : txn->DirtiedPages()) {
+        by_object[key.object_id].insert(key.page_id);
+    }
+    return by_object;
+}
 
 Transaction* TransactionManager::Begin() {
     if (GetCurrentTransaction() != nullptr) {
@@ -27,9 +40,22 @@ Transaction* TransactionManager::Begin() {
 
     // Both of these are keyed by the calling thread -- see transaction.h
     // and buffer_pool.h's class comments -- so from this point on, only
-    // *this* thread sees txn_ptr as "the" current transaction.
+    // *this* thread sees txn_ptr as "the" current transaction. Every
+    // currently-registered object gets its own observer, each one closing
+    // over *its own* object_id so NotifyDirty always records which object
+    // a page belongs to (docs/DECISIONS.md D-032/D-035) -- copy the
+    // registry under mutex_ first so this loop doesn't hold that lock
+    // while calling into each BufferPool.
     SetCurrentTransactionForThisThread(txn_ptr);
-    buffer_pool_->SetActiveTransactionObserver([txn_ptr](PageId page_id) { txn_ptr->NotifyDirty(page_id); });
+    std::unordered_map<ObjectId, BufferPool*> pools_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pools_snapshot = buffer_pools_;
+    }
+    for (const auto& [object_id, pool] : pools_snapshot) {
+        pool->SetActiveTransactionObserver(
+            [txn_ptr, object_id](PageId page_id) { txn_ptr->NotifyDirty(object_id, page_id); });
+    }
     return txn_ptr;
 }
 
@@ -39,20 +65,34 @@ void TransactionManager::Commit(Transaction* txn) {
             "TransactionManager::Commit: txn must be this calling thread's own active transaction (either it "
             "belongs to a different thread, or it was already committed/aborted)");
     }
-    buffer_pool_->ClearActiveTransactionObserver();
 
-    for (PageId page_id : txn->DirtiedPages()) {
-        Page* page = buffer_pool_->FetchPage(page_id);  // already cached -- just returns it
-        log_manager_->AppendUpdate(txn->Id(), page_id, page->Data());
+    std::unordered_map<ObjectId, BufferPool*> pools_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pools_snapshot = buffer_pools_;
+    }
+    for (const auto& [object_id, pool] : pools_snapshot) {
+        pool->ClearActiveTransactionObserver();
+    }
+
+    std::unordered_map<ObjectId, std::set<PageId>> by_object = GroupDirtiedPagesByObject(txn);
+    for (const auto& [object_id, page_ids] : by_object) {
+        BufferPool* pool = pools_snapshot.at(object_id);  // must already be registered -- see RegisterObject
+        for (PageId page_id : page_ids) {
+            Page* page = pool->FetchPage(page_id);  // already cached -- just returns it
+            log_manager_->AppendUpdate(txn->Id(), object_id, page_id, page->Data());
+        }
     }
     log_manager_->AppendCommit(txn->Id());
-    log_manager_->Flush();                            // fsync the WAL first (write-ahead-logging rule) ...
-    buffer_pool_->FlushPages(txn->DirtiedPages());     // ... then force *this transaction's own* pages to
-                                                        // catch up (see class comment) -- FlushPages, not
-                                                        // FlushAll, so a concurrently-active, still-
-                                                        // uncommitted transaction's dirty pages are never
-                                                        // swept up by this one's commit (see
-                                                        // BufferPool::FlushAll's comment and docs/DECISIONS.md)
+    log_manager_->Flush();  // fsync the WAL first (write-ahead-logging rule) ...
+    for (const auto& [object_id, page_ids] : by_object) {
+        // ... then force *this transaction's own* pages, per object, to
+        // catch up (see class comment) -- FlushPages, not FlushAll, so a
+        // concurrently-active, still-uncommitted transaction's dirty
+        // pages are never swept up by this one's commit (see
+        // BufferPool::FlushAll's comment and docs/DECISIONS.md).
+        pools_snapshot.at(object_id)->FlushPages(page_ids);
+    }
 
     lock_manager_.ReleaseAll(txn->Id());  // Strict 2PL: release only now, after durability, never earlier
     SetCurrentTransactionForThisThread(nullptr);
@@ -67,10 +107,22 @@ void TransactionManager::Abort(Transaction* txn) {
             "TransactionManager::Abort: txn must be this calling thread's own active transaction (either it "
             "belongs to a different thread, or it was already committed/aborted)");
     }
-    buffer_pool_->ClearActiveTransactionObserver();
 
-    for (PageId page_id : txn->DirtiedPages()) {
-        buffer_pool_->DiscardPage(page_id);
+    std::unordered_map<ObjectId, BufferPool*> pools_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pools_snapshot = buffer_pools_;
+    }
+    for (const auto& [object_id, pool] : pools_snapshot) {
+        pool->ClearActiveTransactionObserver();
+    }
+
+    std::unordered_map<ObjectId, std::set<PageId>> by_object = GroupDirtiedPagesByObject(txn);
+    for (const auto& [object_id, page_ids] : by_object) {
+        BufferPool* pool = pools_snapshot.at(object_id);
+        for (PageId page_id : page_ids) {
+            pool->DiscardPage(page_id);
+        }
     }
     log_manager_->AppendAbort(txn->Id());
 

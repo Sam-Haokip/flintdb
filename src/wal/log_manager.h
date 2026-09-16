@@ -25,7 +25,12 @@ namespace flintdb {
 // a portable wire format, since a single FlintDB file is never read on a
 // different machine):
 //
-//   [ lsn:8 | type:1 | txn_id:8 | page_id:4 | payload_len:4 | payload... | checksum:4 ]
+//   [ lsn:8 | type:1 | txn_id:8 | object_id:4 | page_id:4 | payload_len:4 | payload... | checksum:4 ]
+//
+// object_id (Phase 5, docs/DECISIONS.md D-032) identifies which table/index's
+// file page_id refers to -- see log_record.h's LogRecord::object_id for why
+// a bare page_id stopped being globally unique once every table/index got
+// its own file (docs/DECISIONS.md D-031).
 //
 // payload_len is 0 for kBegin/kCommit/kAbort and PAGE_SIZE for kUpdate
 // (whose payload is the full new page image). checksum is an FNV-1a hash
@@ -84,7 +89,7 @@ class LogManager {
     // immediately, since that's the specific point that makes a
     // transaction durably committed.
     Lsn AppendBegin(TxnId txn_id);
-    Lsn AppendUpdate(TxnId txn_id, PageId page_id, const char* page_image);
+    Lsn AppendUpdate(TxnId txn_id, ObjectId object_id, PageId page_id, const char* page_image);
     Lsn AppendCommit(TxnId txn_id);
     Lsn AppendAbort(TxnId txn_id);
 
@@ -115,7 +120,7 @@ class LogManager {
     Lsn NextLsn() const;
 
  private:
-    Lsn AppendRecord(LogRecordType type, TxnId txn_id, PageId page_id, const char* payload,
+    Lsn AppendRecord(LogRecordType type, TxnId txn_id, ObjectId object_id, PageId page_id, const char* payload,
                       uint32_t payload_len);
 
     int fd_;

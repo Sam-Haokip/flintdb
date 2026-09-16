@@ -25,6 +25,16 @@ add_library(flintdb_core STATIC
   src/txn/transaction_manager.cpp
   src/txn/lock_manager.cpp
   src/txn/transaction.cpp
+  src/catalog/catalog.cpp
+  src/db/database.cpp
+  src/sql/token.cpp
+  src/sql/lexer.cpp
+  src/sql/parser.cpp
+  src/sql/sql_semantics.cpp
+  src/sql/planner.cpp
+  src/sql/row_codec.cpp
+  src/sql/executor.cpp
+  src/sql/session.cpp
 )
 target_include_directories(flintdb_core PUBLIC src)
 target_link_libraries(flintdb_core PUBLIC Threads::Threads)
@@ -43,6 +53,14 @@ add_executable(flintdb_tests
   tests/test_lock_manager.cpp
   tests/test_transaction_context.cpp
   tests/test_isolation.cpp
+  tests/test_catalog.cpp
+  tests/test_database.cpp
+  tests/test_lexer.cpp
+  tests/test_parser.cpp
+  tests/test_planner.cpp
+  tests/test_executor.cpp
+  tests/test_session.cpp
+  tests/test_end_to_end.cpp
 )
 target_link_libraries(flintdb_tests PRIVATE flintdb_core)
 target_include_directories(flintdb_tests PRIVATE tests)

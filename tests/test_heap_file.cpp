@@ -19,7 +19,7 @@ FLINTDB_TEST(heap_file_insert_then_scan_returns_every_row) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    HeapFile heap(&bp);
+    HeapFile heap(0, &bp);
 
     heap.Insert("alice,30");
     heap.Insert("bob,25");
@@ -36,18 +36,53 @@ FLINTDB_TEST(heap_file_insert_returns_distinct_rids) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    HeapFile heap(&bp);
+    HeapFile heap(0, &bp);
 
     RID r0 = heap.Insert("row-0");
     RID r1 = heap.Insert("row-1");
     FLINTDB_CHECK(r0 != r1);
 }
 
+FLINTDB_TEST(heap_file_get_row_returns_the_bytes_at_a_known_rid) {
+    TempFile tmp;
+    DiskManager dm(tmp.path());
+    BufferPool bp(&dm);
+    HeapFile heap(0, &bp);
+
+    RID r0 = heap.Insert("row-0");
+    RID r1 = heap.Insert("row-1");
+
+    auto row0 = heap.GetRow(r0);
+    FLINTDB_CHECK(row0.has_value());
+    FLINTDB_CHECK_EQ(*row0, std::string("row-0"));
+
+    auto row1 = heap.GetRow(r1);
+    FLINTDB_CHECK(row1.has_value());
+    FLINTDB_CHECK_EQ(*row1, std::string("row-1"));
+}
+
+FLINTDB_TEST(heap_file_get_row_of_unknown_or_deleted_rid_returns_nullopt) {
+    TempFile tmp;
+    DiskManager dm(tmp.path());
+    BufferPool bp(&dm);
+    HeapFile heap(0, &bp);
+
+    RID real = heap.Insert("row-0");
+
+    // Unknown page entirely.
+    FLINTDB_CHECK(!heap.GetRow(RID{999, 0}).has_value());
+    // Known page, out-of-range slot.
+    FLINTDB_CHECK(!heap.GetRow(RID{real.page_id, static_cast<SlotId>(real.slot_id + 1)}).has_value());
+    // Deleted slot.
+    FLINTDB_CHECK(heap.Delete(real));
+    FLINTDB_CHECK(!heap.GetRow(real).has_value());
+}
+
 FLINTDB_TEST(heap_file_spans_multiple_pages_when_rows_dont_fit_in_one) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    HeapFile heap(&bp);
+    HeapFile heap(0, &bp);
 
     std::string base(200, 'r');
     const int n = 40;  // 40 * (200 + slot overhead) exceeds one 4KB page
@@ -71,7 +106,7 @@ FLINTDB_TEST(heap_file_delete_removes_exactly_the_target_row) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    HeapFile heap(&bp);
+    HeapFile heap(0, &bp);
 
     RID r0 = heap.Insert("row-0");
     heap.Insert("row-1");
@@ -92,7 +127,7 @@ FLINTDB_TEST(heap_file_delete_of_unknown_rid_is_a_no_op) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    HeapFile heap(&bp);
+    HeapFile heap(0, &bp);
 
     heap.Insert("only-row");
     RID bogus{999, 5};
@@ -106,7 +141,7 @@ FLINTDB_TEST(heap_file_delete_across_many_rows_leaves_exactly_the_survivors) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    HeapFile heap(&bp);
+    HeapFile heap(0, &bp);
 
     // Delete is now tombstone-in-place (D-015): a RID captured before any
     // Delete call stays valid for every later one, unlike the original
@@ -133,7 +168,7 @@ FLINTDB_TEST(heap_file_delete_is_tombstone_in_place_rid_stays_stable) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    HeapFile heap(&bp);
+    HeapFile heap(0, &bp);
 
     RID r0 = heap.Insert("row-0");
     RID r1 = heap.Insert("row-1");
@@ -156,7 +191,7 @@ FLINTDB_TEST(heap_file_delete_of_already_deleted_rid_is_a_no_op) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    HeapFile heap(&bp);
+    HeapFile heap(0, &bp);
 
     RID r0 = heap.Insert("only-row");
     FLINTDB_CHECK(heap.Delete(r0));
@@ -169,13 +204,13 @@ FLINTDB_TEST(heap_file_persists_across_reopen_via_a_new_buffer_pool) {
     {
         DiskManager dm(tmp.path());
         BufferPool bp(&dm);
-        HeapFile heap(&bp);
+        HeapFile heap(0, &bp);
         heap.Insert("durable-ish-row");
         bp.FlushAll();
     }
     DiskManager dm2(tmp.path());
     BufferPool bp2(&dm2);
-    HeapFile heap2(&bp2);  // constructor discovers the existing pages
+    HeapFile heap2(0, &bp2);  // constructor discovers the existing pages
     auto rows = heap2.Scan();
     FLINTDB_CHECK_EQ(rows.size(), 1u);
     FLINTDB_CHECK_EQ(rows[0].second, std::string("durable-ish-row"));
@@ -185,7 +220,7 @@ FLINTDB_TEST(heap_file_insert_rejects_a_row_bigger_than_a_page_can_ever_hold) {
     TempFile tmp;
     DiskManager dm(tmp.path());
     BufferPool bp(&dm);
-    HeapFile heap(&bp);
+    HeapFile heap(0, &bp);
 
     std::string too_big(PAGE_SIZE, 'x');
     bool threw = false;
