@@ -113,4 +113,39 @@ inline void CorruptByteAt(const std::string& path, size_t offset) {
     close(fd);
 }
 
+// Overwrites the raw bytes of `value` at `offset` -- unlike
+// CorruptByteAt's single-bit-flip (good for "some byte got corrupted, we
+// don't care to what"), this sets an exact value, for a test that needs
+// to engineer a *specific* corrupted value -- e.g. a storage-corruption
+// test (docs/DECISIONS.md D-054) that makes a B+-tree internal node's
+// child pointer point back at its own page, deliberately forming a
+// cycle no bit-flip could reliably be relied on to produce.
+template <typename T>
+void WriteRawValueAt(const std::string& path, size_t offset, T value) {
+    int fd = open(path.c_str(), O_RDWR);
+    if (fd < 0) throw std::runtime_error("WriteRawValueAt: open failed");
+    if (pwrite(fd, &value, sizeof(T), static_cast<off_t>(offset)) != static_cast<ssize_t>(sizeof(T))) {
+        close(fd);
+        throw std::runtime_error("WriteRawValueAt: pwrite failed");
+    }
+    close(fd);
+}
+
+// Reads sizeof(T) raw bytes at `offset` back out as a T -- the read-side
+// counterpart to WriteRawValueAt, for a test that needs to inspect an
+// on-disk value (e.g. a page's own PageId/PageType tag) before deciding
+// what to corrupt and how.
+template <typename T>
+T ReadRawValueAt(const std::string& path, size_t offset) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("ReadRawValueAt: open failed");
+    T value;
+    if (pread(fd, &value, sizeof(T), static_cast<off_t>(offset)) != static_cast<ssize_t>(sizeof(T))) {
+        close(fd);
+        throw std::runtime_error("ReadRawValueAt: pread failed");
+    }
+    close(fd);
+    return value;
+}
+
 }  // namespace flintdb::testing

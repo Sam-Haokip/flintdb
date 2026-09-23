@@ -8,12 +8,15 @@ namespace flintdb {
 // A Record ID identifies exactly one row within one heap file: which page
 // it's on, and which slot within that page's slot directory.
 //
-// Phase-1 caveat (see docs/DECISIONS.md): HeapFile::Delete rewrites the
-// whole file, which reassigns every surviving row's RID. A RID is only
-// guaranteed stable between calls that don't delete anything. Nothing in
-// Phase 1 stores a RID across a delete, so this is safe for now — it will
-// need revisiting once Phase 2's B-tree starts storing RIDs as index
-// entries.
+// A RID stays valid across a Delete of some *other* row: HeapFile::Delete
+// tombstones a row's slot in place (storage/heap_file.h, docs/DECISIONS.md
+// D-015) rather than rewriting the file, so it never reassigns any
+// surviving row's RID. (An earlier draft of this comment described the
+// original Phase 1 "delete-by-rewrite" behavior, which did reassign every
+// surviving RID on every delete — that design was replaced before Phase 2's
+// B-tree ever started storing RIDs as index entries, precisely because a
+// B-tree entry pointing at a RID that a later delete silently renumbered
+// would be a real, hard-to-diagnose correctness hazard.)
 struct RID {
     PageId page_id = INVALID_PAGE_ID;
     SlotId slot_id = 0;

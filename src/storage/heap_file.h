@@ -64,6 +64,19 @@ class HeapFile {
     // scope -- see transaction_manager.h's RegisterObject.
     HeapFile(ObjectId object_id, BufferPool* buffer_pool);
 
+    // The largest an encoded row can ever be and still fit on a brand-new,
+    // otherwise-empty page: total page size minus this project's fixed
+    // page header and one slot-directory entry (storage/page.h's
+    // Page::kHeaderSize/kSlotSize). Public -- not just an internal detail
+    // of Insert below -- so a caller that needs to know *before* calling
+    // Insert whether a row will fit can check against the exact same
+    // ceiling Insert itself enforces, rather than keeping a second copy of
+    // this formula that could silently drift from it. Added for
+    // docs/DECISIONS.md D-052: the SQL executor's UPDATE path pre-
+    // validates an entire batch of rows before mutating anything, and
+    // needs this exact number to do so.
+    static constexpr size_t kMaxRowSize = PAGE_SIZE - Page::kHeaderSize - Page::kSlotSize;
+
     RID Insert(const std::string& row_bytes);
 
     // Returns the row's bytes at `rid`, or std::nullopt if `rid` doesn't

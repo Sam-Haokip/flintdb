@@ -345,6 +345,110 @@ FLINTDB_TEST(executor_update_setting_primary_key_to_a_duplicate_value_throws_and
     FLINTDB_CHECK_EQ(Run(db, "SELECT * FROM widgets WHERE id = 2").rows[0][1].string_value, std::string("b"));
 }
 
+FLINTDB_TEST(executor_update_matching_multiple_rows_that_collide_with_each_other_throws_and_leaves_every_row_unchanged) {
+    // docs/DECISIONS.md D-052: found by Phase 6's differential-testing
+    // harness (D-051), not by inspection. The test above only ever
+    // matches a single row per UPDATE, which happens to come out right
+    // even under the original (buggy) per-row delete/check/insert loop,
+    // as long as the whole statement is wrapped in its own transaction
+    // that gets aborted on failure -- RunInTxn does exactly that, and
+    // transaction-level abort (discarding every dirty page under
+    // no-steal) incidentally undoes a single row's partial mutation as a
+    // side effect. This test reproduces what that masked: an UPDATE
+    // matching *multiple* rows, checked from *inside* the same
+    // still-open transaction the failing statement ran in, with no
+    // ROLLBACK issued yet -- so nothing but ExecuteUpdate's own
+    // statement-level atomicity can be responsible for what a read sees
+    // next.
+    TempDir dir;
+    Database db(dir.path());
+    Run(db, "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)");
+    RunInTxn(db, "INSERT INTO widgets VALUES (1, 'a')");
+    RunInTxn(db, "INSERT INTO widgets VALUES (2, 'b')");
+    RunInTxn(db, "INSERT INTO widgets VALUES (3, 'c')");
+
+    TransactionManager& txm = db.GetTransactionManager();
+    Transaction* txn = txm.Begin();
+
+    // Matches all three rows (no WHERE) and sets every one of them to the
+    // same PRIMARY KEY -- the original per-row loop would fully migrate
+    // whichever row it processed first to id=9, then lose the second
+    // row's own data outright the moment the (correctly firing)
+    // duplicate-key check threw for it, leaving the third row untouched.
+    // None of that may happen: the whole statement must have zero
+    // effect, not a partial one.
+    bool threw = false;
+    try {
+        ExecuteInCurrentTransaction(db, Parse("UPDATE widgets SET id = 9"));
+    } catch (const SqlSemanticError&) {
+        threw = true;
+    }
+    FLINTDB_CHECK(threw);
+
+    // Checked from *inside* the still-open transaction -- deliberately
+    // not yet rolled back -- so a pass here can only mean ExecuteUpdate
+    // itself never mutated anything, not that a later ROLLBACK cleaned up
+    // after it.
+    ExecuteResult rows = ExecuteInCurrentTransaction(db, Parse("SELECT * FROM widgets"));
+    FLINTDB_CHECK_EQ(rows.rows.size(), 3u);
+    for (const auto& row : rows.rows) {
+        if (row[0].int_value == 1) FLINTDB_CHECK_EQ(row[1].string_value, std::string("a"));
+        if (row[0].int_value == 2) FLINTDB_CHECK_EQ(row[1].string_value, std::string("b"));
+        if (row[0].int_value == 3) FLINTDB_CHECK_EQ(row[1].string_value, std::string("c"));
+    }
+
+    txm.Commit(txn);  // nothing changed, but close the transaction out cleanly
+
+    // And once more after a clean commit, for good measure.
+    ExecuteResult after = Run(db, "SELECT * FROM widgets");
+    FLINTDB_CHECK_EQ(after.rows.size(), 3u);
+}
+
+FLINTDB_TEST(executor_update_producing_an_oversized_row_throws_and_leaves_every_row_unchanged) {
+    // docs/DECISIONS.md D-052's second trigger for the same class of bug:
+    // HeapFile::Insert rejects a row bigger than HeapFile::kMaxRowSize,
+    // which the original per-row UPDATE loop could hit *after* already
+    // deleting that row's own old entry -- the same partial-mutation
+    // hazard as the PRIMARY KEY case above, from a completely different
+    // cause, which is exactly why the fix (docs/DECISIONS.md D-052)
+    // validates the whole batch's encoded size up front too, not just
+    // PRIMARY KEY uniqueness.
+    TempDir dir;
+    Database db(dir.path());
+    Run(db, "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)");
+    RunInTxn(db, "INSERT INTO widgets VALUES (1, 'a')");
+    RunInTxn(db, "INSERT INTO widgets VALUES (2, 'b')");
+
+    // Comfortably over HeapFile::kMaxRowSize (PAGE_SIZE - header - slot,
+    // 4076 bytes today) once the 8-byte id and 4-byte TEXT length prefix
+    // are added in -- large enough to stay well clear of that ceiling even
+    // if page layout constants change later.
+    std::string huge(5000, 'x');
+    std::string sql = "UPDATE widgets SET name = '" + huge + "' WHERE id = 1";
+
+    TransactionManager& txm = db.GetTransactionManager();
+    Transaction* txn = txm.Begin();
+    bool threw = false;
+    try {
+        ExecuteInCurrentTransaction(db, Parse(sql));
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    FLINTDB_CHECK(threw);
+
+    // Row 1 (the match) must not have been deleted-and-lost, and row 2
+    // (never matched at all) must be completely untouched -- both
+    // checked from inside the still-open transaction, same reasoning as
+    // the test above.
+    ExecuteResult rows = ExecuteInCurrentTransaction(db, Parse("SELECT * FROM widgets"));
+    FLINTDB_CHECK_EQ(rows.rows.size(), 2u);
+    for (const auto& row : rows.rows) {
+        if (row[0].int_value == 1) FLINTDB_CHECK_EQ(row[1].string_value, std::string("a"));
+        if (row[0].int_value == 2) FLINTDB_CHECK_EQ(row[1].string_value, std::string("b"));
+    }
+    txm.Commit(txn);
+}
+
 FLINTDB_TEST(executor_update_leaving_primary_key_unchanged_does_not_spuriously_collide_with_itself) {
     TempDir dir;
     Database db(dir.path());

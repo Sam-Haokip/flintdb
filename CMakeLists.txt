@@ -61,6 +61,7 @@ add_executable(flintdb_tests
   tests/test_executor.cpp
   tests/test_session.cpp
   tests/test_end_to_end.cpp
+  tests/test_storage_corruption.cpp
 )
 target_link_libraries(flintdb_tests PRIVATE flintdb_core)
 target_include_directories(flintdb_tests PRIVATE tests)
@@ -69,6 +70,11 @@ add_executable(bench_index_vs_scan
   bench/bench_index_vs_scan.cpp
 )
 target_link_libraries(bench_index_vs_scan PRIVATE flintdb_core)
+
+add_executable(flintdb_cli
+  tools/flintdb_cli.cpp
+)
+target_link_libraries(flintdb_cli PRIVATE flintdb_core)
 
 enable_testing()
 add_test(NAME flintdb_tests COMMAND flintdb_tests)

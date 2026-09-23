@@ -2,6 +2,8 @@
 
 #include "../wal/recovery.h"
 
+#include <stdexcept>
+
 namespace flintdb {
 
 Database::Database(std::string dir_path)
@@ -111,6 +113,20 @@ BPlusTree* Database::GetIndexByName(const std::string& index_name) {
     const IndexInfo* index = catalog_.FindIndex(index_name);
     if (index == nullptr) return nullptr;
     return GetIndex(index->object_id);
+}
+
+void Database::Checkpoint() {
+    if (txn_manager_.HasActiveTransaction()) {
+        throw std::logic_error(
+            "Database::Checkpoint: cannot checkpoint while a transaction is active anywhere -- "
+            "LogManager::Checkpoint's own precondition (wal/log_manager.h) needs every already-appended "
+            "record's effect to already be durable in the data file, which no-steal (docs/SPEC.md section 2) "
+            "cannot guarantee for a transaction that hasn't committed yet");
+    }
+    for (auto& [object_id, storage] : objects_) {
+        storage.buffer_pool->FlushAll();
+    }
+    log_manager_.Checkpoint();
 }
 
 }  // namespace flintdb

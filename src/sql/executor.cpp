@@ -7,6 +7,7 @@
 
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 
 namespace flintdb {
@@ -131,13 +132,15 @@ void DeleteFromAllIndexes(Database& db, const Catalog& catalog, const TableInfo&
 }
 
 // Throws SqlSemanticError if `table` has a PRIMARY KEY and `values`'
-// value at that column already exists in the PK index. Callers run this
-// against an index that no longer contains the row being updated/
-// inserted (i.e. before INSERT touches anything, and after UPDATE has
-// already deleted the old entry) -- see docs/DECISIONS.md D-048 for why
-// that ordering makes an unchanged PRIMARY KEY re-insert its own
-// just-vacated key correctly, rather than spuriously colliding with
-// itself.
+// value at that column already exists in the PK index. The caller must
+// run this against an index that does not yet contain an entry for the
+// row being written -- true unconditionally for INSERT, the only
+// remaining caller (nothing has been added yet). UPDATE used to call
+// this too, once per row, interleaved with that row's own delete-then-
+// reinsert; docs/DECISIONS.md D-052 replaced that with
+// ValidateUpdateBatch below, specifically because checking one row at a
+// time this way cannot safely cover a multi-row UPDATE -- see that
+// function's own comment for the full reasoning.
 void CheckPrimaryKeyUniqueness(Database& db, const Catalog& catalog, const TableInfo& table,
                                 const std::vector<LiteralValue>& values) {
     const IndexInfo* pk = catalog.PrimaryKeyIndex(table.name);
@@ -146,6 +149,98 @@ void CheckPrimaryKeyUniqueness(Database& db, const Catalog& catalog, const Table
     if (!db.GetIndex(pk->object_id)->Search(key).empty()) {
         throw SqlSemanticError("duplicate PRIMARY KEY value " + std::to_string(key) + " for table '" + table.name +
                                 "'");
+    }
+}
+
+// Validates an entire UPDATE batch -- every matched row's about-to-be-
+// written new values -- before ExecuteUpdate mutates anything at all.
+//
+// docs/DECISIONS.md D-052: the original design checked PRIMARY KEY
+// uniqueness one row at a time, interleaved with that same row's own
+// delete-then-reinsert (mirroring INSERT's check-before-mutate pattern,
+// D-048). That is correct for a single row, but breaks for a multi-row
+// UPDATE in two distinct ways once the loop is allowed to fail partway
+// through:
+//   1. Two rows *in the same statement* can compute the same new
+//      PRIMARY KEY. A per-row check against the live index can't catch
+//      this: at the point the second colliding row is checked, the
+//      first one hasn't been "inserted" yet in any index-visible sense
+//      unless the loop already reached it -- so whether the collision is
+//      even detected (and which row is blamed for it) would depend on
+//      iteration order, not on the two rows genuinely colliding.
+//   2. A later row's encoded size can exceed what HeapFile::Insert will
+//      accept (HeapFile::kMaxRowSize) -- a completely different
+//      exception, but hit at exactly the same point in the loop.
+// Either failure used to happen *after* every row processed earlier in
+// the same loop had already been fully migrated to its new value, and
+// after the failing row's own old entry had already been deleted with
+// nothing reinserted in its place -- an UPDATE that must fail with zero
+// effect instead left the table silently, partially mutated (found by
+// Phase 6's differential-testing harness, D-051, not by inspection: see
+// D-052 for the exact repro and why the existing single-row regression
+// test never exercised this).
+//
+// This function performs every check the mutation loop could ever fail
+// on, against the batch as a whole and the table's still-completely-
+// untouched current state (matched's own entries -- and therefore the
+// PK index's entries for them -- are still live at this point; nothing
+// has mutated yet). Once this call returns without throwing,
+// ExecuteUpdate's mutation loop is structurally guaranteed to succeed
+// for every row, so there is no window left in which a caller --
+// autocommit or an explicit, still-open transaction alike -- could ever
+// observe a partial result.
+void ValidateUpdateBatch(Database& db, const Catalog& catalog, const TableInfo& table,
+                          const std::vector<std::pair<RID, std::vector<LiteralValue>>>& matched,
+                          const std::vector<std::vector<LiteralValue>>& new_values_per_row,
+                          const std::vector<std::string>& new_row_bytes_per_row) {
+    // 1. Every row must fit on a page at all -- checked against the exact
+    // ceiling HeapFile::Insert itself enforces (HeapFile::kMaxRowSize is
+    // the single source of truth both this check and Insert's own read
+    // from), so the two can't silently drift apart. Same exception type
+    // and message HeapFile::Insert itself would throw, since as far as a
+    // caller is concerned this is the same failure, just caught earlier.
+    for (const std::string& bytes : new_row_bytes_per_row) {
+        if (bytes.size() > HeapFile::kMaxRowSize) {
+            throw std::invalid_argument("HeapFile::Insert: row is larger than a page can ever hold");
+        }
+    }
+
+    const IndexInfo* pk = catalog.PrimaryKeyIndex(table.name);
+    if (pk == nullptr) return;  // no PRIMARY KEY on this table -- nothing left to check
+    size_t pk_col = ColumnIndex(table, pk->column_name);
+
+    // Every RID this UPDATE is about to delete-then-reinsert. A live
+    // PK-index hit against one of these RIDs below isn't an external
+    // collision -- that row's own old entry is guaranteed gone by the
+    // time the mutation loop actually runs, freeing its key up.
+    std::unordered_set<RID> updating_rids;
+    for (const auto& [rid, old_values] : matched) updating_rids.insert(rid);
+
+    // 2. No two rows in this same batch may land on the same new
+    // PRIMARY KEY -- see this function's own comment above for why a
+    // per-row, check-against-the-live-index approach can't detect this.
+    std::unordered_set<int64_t> new_keys_seen;
+    for (const std::vector<LiteralValue>& new_values : new_values_per_row) {
+        int64_t key = new_values[pk_col].int_value;
+        if (!new_keys_seen.insert(key).second) {
+            throw SqlSemanticError("duplicate PRIMARY KEY value " + std::to_string(key) + " for table '" +
+                                    table.name + "' (this UPDATE would give two matched rows the same key)");
+        }
+    }
+
+    // 3. No new key may already belong to a live row *outside* this
+    // batch. The PK index still holds every matched row's own old entry
+    // at this point (nothing has mutated yet), so a hit here is only a
+    // real, external collision if the RID it names isn't itself one of
+    // the rows this same UPDATE is about to move off that key.
+    for (const std::vector<LiteralValue>& new_values : new_values_per_row) {
+        int64_t key = new_values[pk_col].int_value;
+        for (RID found : db.GetIndex(pk->object_id)->Search(key)) {
+            if (updating_rids.find(found) == updating_rids.end()) {
+                throw SqlSemanticError("duplicate PRIMARY KEY value " + std::to_string(key) + " for table '" +
+                                        table.name + "'");
+            }
+        }
     }
 }
 
@@ -279,27 +374,49 @@ ExecuteResult ExecuteUpdate(Database& db, const UpdateStatement& stmt) {
         matched.emplace_back(rid, std::move(values));
     }
 
-    ExecuteResult result;
+    // Compute every matched row's new values and encoded bytes up front,
+    // still against the untouched snapshot above -- nothing has mutated
+    // yet. This is what lets ValidateUpdateBatch check the whole
+    // statement before any of it runs (docs/DECISIONS.md D-052), and
+    // conveniently means the mutation loop below never re-encodes a row
+    // it already encoded here.
+    std::vector<std::vector<LiteralValue>> new_values_per_row;
+    std::vector<std::string> new_row_bytes_per_row;
+    new_values_per_row.reserve(matched.size());
+    new_row_bytes_per_row.reserve(matched.size());
     for (auto& [rid, old_values] : matched) {
         std::vector<LiteralValue> new_values = old_values;
         for (size_t i = 0; i < stmt.assignments.size(); i++) {
             new_values[assignment_col_idx[i]] = stmt.assignments[i].value;
         }
+        new_row_bytes_per_row.push_back(EncodeRow(table->columns, new_values));
+        new_values_per_row.push_back(std::move(new_values));
+    }
 
-        // HeapFile has no in-place update (storage/heap_file.h), so this
-        // is delete-then-reinsert: every index -- not just ones the SET
-        // clause actually touches -- gets its old (value, RID) entry
-        // removed here and a new one added below, since the RID changes
-        // regardless of whether a given index's own column did.
+    // Every way this UPDATE could ever fail -- a duplicate PRIMARY KEY
+    // (within this batch, or against an untouched row) or an oversized
+    // encoded row -- is checked here, against the batch as a whole and
+    // the table's still-completely-untouched state. Nothing below this
+    // call can fail once it returns (docs/DECISIONS.md D-052), so the
+    // mutation loop is unconditionally all-or-nothing from any caller's
+    // point of view.
+    ValidateUpdateBatch(db, catalog, *table, matched, new_values_per_row, new_row_bytes_per_row);
+
+    // HeapFile has no in-place update (storage/heap_file.h), so this is
+    // delete-then-reinsert: every index -- not just ones the SET clause
+    // actually touches -- gets its old (value, RID) entry removed here
+    // and a new one added below, since the RID changes regardless of
+    // whether a given index's own column did.
+    ExecuteResult result;
+    for (size_t i = 0; i < matched.size(); i++) {
+        const RID rid = matched[i].first;
+        const std::vector<LiteralValue>& old_values = matched[i].second;
+        const std::vector<LiteralValue>& new_values = new_values_per_row[i];
+
         DeleteFromAllIndexes(db, catalog, *table, old_values, rid);
         heap->Delete(rid);
 
-        // Re-checked against an index that no longer holds this row's own
-        // old PK entry -- see CheckPrimaryKeyUniqueness's comment.
-        CheckPrimaryKeyUniqueness(db, catalog, *table, new_values);
-
-        std::string new_row_bytes = EncodeRow(table->columns, new_values);
-        RID new_rid = heap->Insert(new_row_bytes);
+        RID new_rid = heap->Insert(new_row_bytes_per_row[i]);
         InsertIntoAllIndexes(db, catalog, *table, new_values, new_rid);
 
         result.rows_affected++;

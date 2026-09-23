@@ -155,6 +155,30 @@ class Database {
     HeapFile* GetHeapFileForTable(const std::string& table_name);
     BPlusTree* GetIndexByName(const std::string& index_name);
 
+    // Makes every already-committed change durable in each object's own
+    // data file (BufferPool::FlushAll on every registered object), then
+    // empties the shared WAL (LogManager::Checkpoint, D-018) so a later
+    // reopen's recovery has nothing left to redo. A capability gap found
+    // while writing docs/DECISIONS.md D-054's storage-corruption tests:
+    // nothing in Phase 5/6 had ever needed to checkpoint *through* the
+    // Database facade before (every earlier checkpoint test, Phase 3's
+    // tests/test_crash_recovery.cpp, constructs LogManager/BufferPool
+    // directly, below this facade), so it was never exposed here, but a
+    // real caller -- or a test that needs a corrupted byte on disk to
+    // actually stay corrupted through a reopen, rather than being
+    // silently restored by WAL redo -- has an obvious, legitimate need
+    // for it: without this, the WAL also just grows without bound
+    // forever in any long-running use of this facade.
+    //
+    // Throws std::logic_error if any transaction is active anywhere --
+    // LogManager::Checkpoint's own precondition (wal/log_manager.h): with
+    // no-steal (docs/SPEC.md section 2), an active transaction's dirty
+    // pages must never reach the data file before it commits, so
+    // checkpointing while one is still open could not guarantee what
+    // Checkpoint's contract requires (every already-appended record's
+    // effect already durable in the data file).
+    void Checkpoint();
+
  private:
     // One table's or index's full storage stack. Exactly one of
     // heap_file/btree is non-null for any given entry -- an ObjectId

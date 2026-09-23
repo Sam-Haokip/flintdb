@@ -32,7 +32,6 @@ HeapFile::HeapFile(ObjectId object_id, BufferPool* buffer_pool) : object_id_(obj
 }
 
 RID HeapFile::Insert(const std::string& row_bytes) {
-    constexpr size_t kMaxRowSize = PAGE_SIZE - Page::kHeaderSize - Page::kSlotSize;
     if (row_bytes.size() > kMaxRowSize) {
         throw std::invalid_argument("HeapFile::Insert: row is larger than a page can ever hold");
     }

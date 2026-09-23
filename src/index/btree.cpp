@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 
 namespace flintdb {
 
@@ -76,6 +77,39 @@ void LockRoot(ObjectId object_id, LockMode mode) { LockPage(object_id, kRootHead
 constexpr size_t kLeafEntrySize = sizeof(int64_t) + sizeof(PageId) + sizeof(SlotId);        // 14
 constexpr size_t kInternalKeySize = sizeof(int64_t);                                        // 8
 constexpr size_t kInternalChildSize = sizeof(PageId);                                       // 4
+
+// docs/DECISIONS.md D-054: every read-only traversal below (Search,
+// RangeScanAll's root-to-leaf descent and its leaf-chain walk, Height,
+// and ValidateInvariants's recursive check) used to loop or recurse with
+// no bound at all -- correct as long as the on-disk structure is
+// correct, but this engine has no per-page checksum (docs/SPEC.md; a
+// deliberate, documented non-goal, not an oversight), so a corrupted
+// child or next-leaf pointer that happens to land on another in-range
+// page can form a cycle a bound-free traversal will follow forever. A
+// tree over this page size holds so many keys per node
+// (kLeafMaxKeys/kInternalMaxKeys below) that even an astronomically
+// large, perfectly-packed tree could never legitimately be more than a
+// handful of levels deep, or have anywhere near this many leaves
+// chained together -- so this bound can only ever fire on a corrupted,
+// cyclic structure, never on correct data, however large.
+constexpr size_t kMaxTraversalSteps = 10000;
+
+[[noreturn]] void ThrowTraversalStepsExceeded() {
+    throw std::runtime_error(
+        "BPlusTree: traversal exceeded the maximum step count -- this can only mean a corrupted child or "
+        "next-leaf pointer has formed a cycle (docs/DECISIONS.md D-054), since no uncorrupted tree over this "
+        "page size could ever legitimately be this deep or have this many leaves in one chain");
+}
+
+// A separate, smaller bound for ValidateSubtree's *recursion* below
+// (rather than kMaxTraversalSteps' iterative loop counter): unlike an
+// iterative loop, each extra level of recursion consumes real call
+// stack, so this needs to be small enough to never risk a stack
+// overflow crash itself while still being reached long before one could
+// -- 500 stack frames is nowhere close to any real platform's default
+// stack size, yet still wildly larger than any uncorrupted tree over
+// this page size could ever legitimately be deep.
+constexpr size_t kMaxValidateDepth = 500;
 
 }  // namespace
 
@@ -358,6 +392,7 @@ size_t BPlusTree::Height() const {
     LockPage(object_id_, cur, LockMode::kShared);
     Page* page = buffer_pool_->FetchPage(cur);
     while (ReadPageType(page->Data()) != PageType::kBTreeLeaf) {
+        if (h > kMaxTraversalSteps) ThrowTraversalStepsExceeded();
         InternalNode node = DeserializeInternal(page->Data());
         cur = node.children.front();
         LockPage(object_id_, cur, LockMode::kShared);
@@ -374,7 +409,9 @@ std::vector<RID> BPlusTree::Search(int64_t key) const {
     if (root == INVALID_PAGE_ID) return results;
 
     PageId cur = root;
+    size_t steps = 0;
     while (true) {
+        if (++steps > kMaxTraversalSteps) ThrowTraversalStepsExceeded();
         LockPage(object_id_, cur, LockMode::kShared);
         Page* page = buffer_pool_->FetchPage(cur);
         if (ReadPageType(page->Data()) == PageType::kBTreeLeaf) {
@@ -399,14 +436,18 @@ std::vector<std::pair<int64_t, RID>> BPlusTree::RangeScanAll() const {
     PageId cur = root;
     LockPage(object_id_, cur, LockMode::kShared);
     Page* page = buffer_pool_->FetchPage(cur);
+    size_t descent_steps = 0;
     while (ReadPageType(page->Data()) != PageType::kBTreeLeaf) {
+        if (++descent_steps > kMaxTraversalSteps) ThrowTraversalStepsExceeded();
         InternalNode node = DeserializeInternal(page->Data());
         cur = node.children.front();
         LockPage(object_id_, cur, LockMode::kShared);
         page = buffer_pool_->FetchPage(cur);
     }
     // `cur`/`page` are now the leftmost leaf, already locked and fetched.
+    size_t chain_steps = 0;
     while (true) {
+        if (++chain_steps > kMaxTraversalSteps) ThrowTraversalStepsExceeded();
         LeafNode leaf = DeserializeLeaf(page->Data());
         for (size_t i = 0; i < leaf.keys.size(); i++) out.emplace_back(leaf.keys[i], leaf.values[i]);
         if (leaf.next_leaf == INVALID_PAGE_ID) break;
@@ -439,7 +480,16 @@ namespace {
 // below) is the actual reachability guarantee this function exists to
 // verify.
 std::optional<std::string> ValidateSubtree(BufferPool* bp, PageId page_id, bool has_lower, int64_t lower,
-                                            bool has_upper, int64_t upper) {
+                                            bool has_upper, int64_t upper, size_t depth) {
+    // docs/DECISIONS.md D-054: a corrupted child pointer forming a cycle
+    // would otherwise recurse forever (a stack-overflow crash, not a
+    // clean error) -- see kMaxValidateDepth's own comment for why this
+    // bound is safe to check here and can never fire on a real tree.
+    if (depth > kMaxValidateDepth) {
+        return "subtree rooted at " + std::to_string(page_id) + " exceeded the maximum validation depth -- "
+                                                                  "this can only mean a corrupted child pointer "
+                                                                  "has formed a cycle";
+    }
     Page* page = bp->FetchPage(page_id);
     if (ReadPageType(page->Data()) == PageType::kBTreeLeaf) {
         LeafNode leaf = DeserializeLeaf(page->Data());
@@ -482,7 +532,8 @@ std::optional<std::string> ValidateSubtree(BufferPool* bp, PageId page_id, bool 
         int64_t child_lower = (i == 0) ? lower : node.keys[i - 1];
         bool child_has_upper = (i == node.children.size() - 1) ? has_upper : true;
         int64_t child_upper = (i == node.children.size() - 1) ? upper : node.keys[i];
-        auto err = ValidateSubtree(bp, node.children[i], child_has_lower, child_lower, child_has_upper, child_upper);
+        auto err = ValidateSubtree(bp, node.children[i], child_has_lower, child_lower, child_has_upper, child_upper,
+                                    depth + 1);
         if (err.has_value()) return err;
     }
     return std::nullopt;
@@ -496,7 +547,7 @@ std::optional<std::string> BPlusTree::ValidateInvariants() const {
     // debug/test-only and not part of the transactional API surface.
     PageId root = GetRootPageId();
     if (root == INVALID_PAGE_ID) return std::nullopt;
-    return ValidateSubtree(buffer_pool_, root, /*has_lower=*/false, 0, /*has_upper=*/false, 0);
+    return ValidateSubtree(buffer_pool_, root, /*has_lower=*/false, 0, /*has_upper=*/false, 0, /*depth=*/0);
 }
 
 void BPlusTree::Insert(int64_t key, RID rid) {
