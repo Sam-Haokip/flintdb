@@ -18,3 +18,79 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  # Phase 6 (docs/DECISIONS.md D-051/D-052): the same 279-test suite above
+  # only ever runs SQL this project itself wrote, so it can never catch a
+  # place where FlintDB's behavior disagrees with what SQL is actually
+  # supposed to mean. This job builds the flintdb_cli driver and runs the
+  # differential-testing harness against a real SQLite for a bounded
+  # number of random, seeded statement sequences -- bounded so a normal
+  # push/PR gets an answer in well under a minute (500 seeds x 60 ops
+  # measured locally at ~20s), not because a longer run wouldn't also be
+  # worth doing (scripts/differential_test.py takes --seeds/--ops for
+  # exactly that, for a manual deeper run).
+  differential-test:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build flintdb_cli
+        run: cmake --build build --target flintdb_cli --parallel
+
+      - name: Run differential harness against SQLite
+        run: python3 scripts/differential_test.py --seeds 500 --ops 60
+
+  # Phase 6 (docs/DECISIONS.md D-053): asks a different question than the
+  # job above -- not "does FlintDB agree with SQLite on valid SQL" but
+  # "can any byte sequence at all crash, hang, or trip a sanitizer in the
+  # hand-written lexer/parser." scripts/run_fuzz_parser.sh needs Clang's
+  # compiler-rt (libFuzzer is Clang-specific, unlike the g++ build above),
+  # which this runner's Clang doesn't ship by default -- installed here
+  # the same way this project's own dev environment needed it once
+  # (docs/DECISIONS.md D-053's "real, one-time environment gap"), with an
+  # apt-get-download-and-extract fallback in case the runner image's
+  # package index doesn't have a direct libclang-rt-<N>-dev install path
+  # either. 60 bounded seconds, matched to how a CI check is meant to be
+  # used -- a smoke check on every push, not a substitute for a real,
+  # longer fuzzing session run by hand.
+  fuzz-parser:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libFuzzer runtime for this runner's Clang
+        run: |
+          set -euo pipefail
+          which clang++
+          CLANG_MAJOR="$(clang --version | grep -oP 'version \K[0-9]+' | head -1)"
+          echo "Detected Clang major version: $CLANG_MAJOR"
+          sudo apt-get update
+          if sudo apt-get install -y "libclang-rt-${CLANG_MAJOR}-dev"; then
+            echo "Installed libclang-rt-${CLANG_MAJOR}-dev directly."
+          else
+            echo "Direct install failed -- falling back to manual extraction (docs/DECISIONS.md D-053)."
+            WORKDIR="$(mktemp -d)"
+            cd "$WORKDIR"
+            apt-get download "libclang-rt-${CLANG_MAJOR}-dev"
+            DEB_FILE="$(ls libclang-rt-${CLANG_MAJOR}-dev*.deb | head -1)"
+            dpkg-deb -x "$DEB_FILE" extracted
+            DEST="/usr/lib/llvm-${CLANG_MAJOR}/lib/clang/${CLANG_MAJOR}/lib/linux"
+            sudo mkdir -p "$DEST"
+            sudo cp extracted/usr/lib/llvm-*/lib/clang/*/lib/linux/*x86_64* "$DEST"/
+          fi
+
+      - name: Fuzz the parser (bounded)
+        run: scripts/run_fuzz_parser.sh 60
+
+      - name: Upload crash reproducer (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-parser-crash
+          path: crash-*
+          if-no-files-found: ignore
