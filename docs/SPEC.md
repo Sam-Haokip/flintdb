@@ -107,6 +107,7 @@ Stated here so nobody — including future us — mistakes an absence for an ove
 - No `NULL` value support (see §1.1).
 - No client-server networking, connection pooling, or authentication — embedded only.
 - No general crash-safety for the *host process* misusing the API (e.g., calling into the engine from multiple threads without going through its own transaction/locking API is undefined behavior, not a supported concurrent-use pattern).
+- No per-page checksum or any other on-disk corruption *detection* (the WAL's own record-level FNV-1a checksum, D-017, is a separate, already-implemented mechanism scoped to torn/corrupted WAL records, not to data or index pages). A silently corrupted byte on disk is read back and used as-is. What this project does instead — checking that the resulting *blast radius* stays bounded rather than trying to detect the corruption in the first place — is Phase 6's storage-corruption testing (D-054).
 
 ---
 
@@ -118,6 +119,8 @@ No claim in this project counts until it's measured or tested:
 - Every durability claim is backed by an actual simulated-crash test at a specific point in the write path, not "the WAL code looks right."
 - Every isolation claim is backed by a named test reproducing (or failing to reproduce) the specific anomaly, not a general "transactions work."
 - Every correctness claim about SQL semantics is checked differentially against real SQLite (Phase 6), not just by inspection.
+- Every claim that adversarial or malformed input can't crash, hang, or trip a sanitizer in the hand-written lexer/parser is backed by fuzzing (Phase 6), not just a fixed list of malformed-input tests this project happened to think of.
+- Every claim about what happens when a database file is corrupted on disk is backed by a test that corrupts real on-disk bytes and observes the actual resulting behavior (Phase 6, D-054) — bounded to the non-goal above (blast radius, not detection), not a claim that corruption is ever caught.
 
 ---
 
