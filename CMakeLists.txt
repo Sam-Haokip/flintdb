@@ -71,6 +71,11 @@ add_executable(bench_index_vs_scan
 )
 target_link_libraries(bench_index_vs_scan PRIVATE flintdb_core)
 
+add_executable(bench_workload
+  bench/bench_workload.cpp
+)
+target_link_libraries(bench_workload PRIVATE flintdb_core)
+
 add_executable(flintdb_cli
   tools/flintdb_cli.cpp
 )

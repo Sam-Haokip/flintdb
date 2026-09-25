@@ -2,6 +2,7 @@
 #include "../common/config.h"
 #include "log_record.h"
 
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -102,7 +103,49 @@ class LogManager {
     // required to guarantee Ti's own already-appended (write()-returned)
     // records are durable, and program order on Ti's own calling thread
     // already ensures those writes happened-before this call.
+    //
+    // Always does its own unconditional fsync() call -- kept exactly as
+    // simple and predictable as it always was, for callers (mainly
+    // tests, and Database::Checkpoint()'s already-quiescent path, D-054)
+    // that want one deterministic fsync with no coalescing. Concurrent
+    // *transaction* commits should call FlushThrough below instead --
+    // see its own comment for why this one doesn't scale under
+    // concurrent load and what FlushThrough does about it (D-055).
     void Flush();
+
+    // The group-commit-aware counterpart to Flush(), used by
+    // TransactionManager::Commit() (docs/DECISIONS.md D-055). Blocks
+    // until every record up through `target_lsn` (normally the caller's
+    // own just-appended Commit record's LSN) is durable, but does not
+    // guarantee this call itself performed the fsync that made it so --
+    // if another thread is already mid-fsync when this one arrives, this
+    // call simply waits for that fsync (or a subsequent one) to cover
+    // `target_lsn`, rather than issuing a second, redundant fsync of its
+    // own. The thread that *does* end up performing the fsync covers not
+    // just its own target_lsn but every record appended by anyone up to
+    // that moment (queried via NextLsn() immediately before the fsync
+    // call), so commits that arrive while a flush is already in flight
+    // get folded into it for free rather than each paying their own
+    // fsync latency -- the whole point of group commit, and directly
+    // motivated by D-055's benchmark finding that per-transaction fsync
+    // dominates small-transaction latency, and that the resulting long
+    // per-commit critical section (Strict 2PL holds every lock,
+    // including BPlusTree's root-lock sentinel, until commit -- D-028)
+    // was turning concurrent structural index operations into a
+    // wait-die abort storm.
+    //
+    // Safe to call concurrently from many threads (unlike Flush(), which
+    // relies on the caller's own program order to make its "only my own
+    // writes need to be covered" reasoning hold -- FlushThrough instead
+    // establishes that ordering itself, via flush_mutex_/flush_cv_).
+    // Rethrows whatever the underlying fsync() failure produces (the
+    // same error Flush() would) to every thread waiting on the flush
+    // that failed, not just the one that happened to be doing it --
+    // each waiter that doesn't see durable_lsn_ reach its own target
+    // loops back and becomes the next flusher itself, so a transient
+    // fsync failure doesn't strand anyone waiting forever on a flush
+    // that already gave up.
+    void FlushThrough(Lsn target_lsn);
 
     // Wipes the WAL file back to empty and resets the LSN counter to 1.
     // Only correct to call when every already-appended record's effects
@@ -119,6 +162,13 @@ class LogManager {
     // probe record.
     Lsn NextLsn() const;
 
+    // The highest LSN FlushThrough has confirmed durable so far (0 if
+    // FlushThrough has never been called). Exposed for tests -- mirrors
+    // NextLsn()'s own reasoning for existing (D-055): a way to observe
+    // FlushThrough's effect directly rather than only inferring it
+    // indirectly through whether a later call blocks or returns.
+    Lsn DurableLsn() const;
+
  private:
     Lsn AppendRecord(LogRecordType type, TxnId txn_id, ObjectId object_id, PageId page_id, const char* payload,
                       uint32_t payload_len);
@@ -127,6 +177,20 @@ class LogManager {
     Lsn next_lsn_;
     std::vector<LogRecord> records_on_open_;
     mutable std::mutex mutex_;
+
+    // Group-commit state for FlushThrough (D-055) -- deliberately a
+    // separate mutex from mutex_ above (which guards next_lsn_ and each
+    // AppendRecord call's ordering), so a thread waiting on a flush to
+    // complete never blocks a concurrent AppendRecord, and vice versa.
+    // durable_lsn_ is the highest LSN confirmed fsync'd so far;
+    // flush_in_progress_ is true exactly while some thread is between
+    // releasing flush_mutex_ to call fsync() and reacquiring it to
+    // publish the result -- see FlushThrough's own comment (this header)
+    // for the full coalescing protocol.
+    mutable std::mutex flush_mutex_;
+    std::condition_variable flush_cv_;
+    Lsn durable_lsn_ = 0;
+    bool flush_in_progress_ = false;
 };
 
 }  // namespace flintdb

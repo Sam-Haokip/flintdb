@@ -4,8 +4,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
 #include <vector>
 
@@ -228,6 +230,77 @@ Lsn LogManager::AppendAbort(TxnId txn_id) {
 void LogManager::Flush() {
     if (fsync(fd_) != 0) {
         throw std::runtime_error(std::string("LogManager::Flush: fsync failed: ") + std::strerror(errno));
+    }
+}
+
+Lsn LogManager::DurableLsn() const {
+    std::lock_guard<std::mutex> lock(flush_mutex_);
+    return durable_lsn_;
+}
+
+void LogManager::FlushThrough(Lsn target_lsn) {
+    std::unique_lock<std::mutex> lock(flush_mutex_);
+    while (durable_lsn_ < target_lsn) {
+        if (flush_in_progress_) {
+            // Someone else is already between releasing flush_mutex_ and
+            // calling fsync (or is calling it right now) -- wait for
+            // *a* flush to finish (this one, or -- if this one doesn't
+            // reach target_lsn -- a later one) and re-check, rather than
+            // racing them for fd_. flush_cv_.wait with no predicate
+            // wakes on every notify_all below; the while loop's own
+            // condition re-check is what makes a spurious or
+            // insufficient wake-up safe.
+            flush_cv_.wait(lock);
+            continue;
+        }
+
+        // No one is flushing right now -- this thread becomes the
+        // flusher for this round. Capture the highest LSN anyone has
+        // appended (via AppendRecord's write(), not necessarily fsync'd
+        // yet) as of right now: if other threads' Commit()s have already
+        // raced ahead and appended their own Commit records while this
+        // thread was arriving here, the one fsync about to happen covers
+        // all of them too, for free -- the actual coalescing that makes
+        // this group commit rather than just "somebody else's problem."
+        flush_in_progress_ = true;
+        Lsn to_cover = std::max(target_lsn, NextLsn() - 1);
+
+        // Deliberately unlocked across the fsync call itself: other
+        // threads can still append new records concurrently (that's a
+        // different mutex, mutex_, untouched here) and new arrivals can
+        // still queue up behind flush_in_progress_ without blocking on
+        // this thread's I/O. Mirrors DiskManager's own reasoning for
+        // keeping physical I/O outside its bookkeeping lock
+        // (storage/disk_manager.h) -- the same principle, applied here
+        // to fix the one place in this codebase that hadn't followed it
+        // yet (see D-055).
+        lock.unlock();
+        std::exception_ptr failure;
+        try {
+            if (fsync(fd_) != 0) {
+                throw std::runtime_error(std::string("LogManager::FlushThrough: fsync failed: ") +
+                                          std::strerror(errno));
+            }
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        lock.lock();
+
+        flush_in_progress_ = false;
+        if (!failure) {
+            durable_lsn_ = std::max(durable_lsn_, to_cover);
+        }
+        // Wake every waiter regardless of outcome: on success they
+        // re-check and return once durable_lsn_ covers them; on failure,
+        // durable_lsn_ hasn't moved, so anyone not already covered by an
+        // *earlier* successful flush loops back and becomes the next
+        // flusher itself (retrying the fsync), rather than hanging
+        // forever on a round that already gave up.
+        flush_cv_.notify_all();
+        if (failure) {
+            lock.unlock();
+            std::rethrow_exception(failure);
+        }
     }
 }
 

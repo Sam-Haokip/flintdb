@@ -2,6 +2,10 @@
 #include "test_framework.h"
 #include "test_utils.h"
 
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <future>
 #include <set>
 #include <thread>
 #include <vector>
@@ -18,6 +22,32 @@ std::array<char, PAGE_SIZE> MakePageImage(char fill) {
     std::array<char, PAGE_SIZE> img;
     img.fill(fill);
     return img;
+}
+
+// Runs `fn` on its own detached thread with a generous-but-finite budget,
+// the same pattern tests/test_storage_corruption.cpp uses for D-054's
+// bounded-traversal fix: FlushThrough (docs/DECISIONS.md D-055) is new,
+// nontrivial cross-thread synchronization (a condition-variable loop), so
+// every test exercising it here fails loudly on a timeout instead of
+// hanging the whole test binary if a lost-wakeup or similar bug is ever
+// introduced. Returns true if `fn` returned within `budget` (whether or
+// not it threw); `*thrown` is set to whatever it threw, if anything. The
+// worker thread is deliberately detached, not joined, so a genuine hang
+// here can't also hang this test binary.
+bool RunBounded(std::function<void()> fn, std::exception_ptr* thrown,
+                 std::chrono::seconds budget = std::chrono::seconds(10)) {
+    auto done = std::make_shared<std::promise<void>>();
+    std::future<void> done_future = done->get_future();
+    std::thread worker([fn = std::move(fn), done, thrown]() {
+        try {
+            fn();
+        } catch (...) {
+            *thrown = std::current_exception();
+        }
+        done->set_value();
+    });
+    worker.detach();
+    return done_future.wait_for(budget) == std::future_status::ready;
 }
 
 }  // namespace
@@ -301,5 +331,95 @@ FLINTDB_TEST(log_manager_concurrent_appends_assign_unique_lsns_that_never_land_o
     FLINTDB_CHECK_EQ(on_disk.size(), static_cast<size_t>(kThreads * kPerThread));
     for (size_t i = 0; i + 1 < on_disk.size(); ++i) {
         FLINTDB_CHECK(on_disk[i].lsn < on_disk[i + 1].lsn);  // strictly increasing -- file order == LSN order
+    }
+}
+
+// --- FlushThrough / group commit (Phase 7, docs/DECISIONS.md D-055) ---
+//
+// The performance benefit (fewer fsync calls under concurrent commits) is
+// what docs/BENCHMARK_PHASE7.md measures; these three tests check
+// FlushThrough's correctness instead: it actually makes the requested LSN
+// durable, an already-covered target returns without hanging, and many
+// threads calling it concurrently all complete with none left stranded --
+// the exact property a lost-wakeup bug in its condition-variable loop
+// would break. Every test here runs the operation under test through
+// RunBounded (this file's anonymous namespace) rather than a plain call,
+// so a regression fails loudly on a timeout instead of hanging the whole
+// suite.
+
+FLINTDB_TEST(log_manager_flush_through_makes_the_target_lsn_durable) {
+    TempFile tmp("wal");
+    LogManager log(tmp.path());
+    log.AppendBegin(1);
+    Lsn commit_lsn = log.AppendCommit(1);
+    FLINTDB_CHECK_EQ(log.DurableLsn(), 0u);  // nothing flushed yet
+
+    std::exception_ptr thrown;
+    bool completed = RunBounded([&] { log.FlushThrough(commit_lsn); }, &thrown);
+    FLINTDB_CHECK(completed);  // must not hang -- D-055's coalescing loop is new cross-thread synchronization
+    if (completed) {
+        FLINTDB_CHECK(thrown == nullptr);
+        FLINTDB_CHECK(log.DurableLsn() >= commit_lsn);
+    }
+}
+
+FLINTDB_TEST(log_manager_flush_through_with_an_already_covered_target_returns_without_hanging) {
+    TempFile tmp("wal");
+    LogManager log(tmp.path());
+    Lsn begin_lsn = log.AppendBegin(1);
+    Lsn commit_lsn = log.AppendCommit(1);
+
+    std::exception_ptr thrown1;
+    FLINTDB_CHECK(RunBounded([&] { log.FlushThrough(commit_lsn); }, &thrown1));
+    FLINTDB_CHECK(thrown1 == nullptr);
+    FLINTDB_CHECK(log.DurableLsn() >= commit_lsn);
+
+    // begin_lsn < commit_lsn is already durable from the flush above, and
+    // nothing new has been appended since -- this call has no record left
+    // to wait for, so it must return immediately rather than block
+    // waiting for a flush that will never come.
+    std::exception_ptr thrown2;
+    bool completed2 = RunBounded([&] { log.FlushThrough(begin_lsn); }, &thrown2);
+    FLINTDB_CHECK(completed2);
+    if (completed2) FLINTDB_CHECK(thrown2 == nullptr);
+}
+
+FLINTDB_TEST(log_manager_flush_through_many_concurrent_commits_all_become_durable_and_none_hang) {
+    // The coalescing benefit itself is measured in docs/BENCHMARK_PHASE7.md
+    // (fewer fsyncs under concurrent commits, translating to higher
+    // throughput) -- not re-proven here. What this checks is correctness
+    // under the exact load pattern that benefit depends on: every
+    // thread's own commit record must eventually become durable, no
+    // thread's FlushThrough call may throw, and nothing may hang.
+    TempFile tmp("wal");
+    LogManager log(tmp.path());
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 50;
+
+    std::atomic<int> exceptions{0};
+    auto work = [&log, &exceptions] {
+        std::vector<std::thread> workers;
+        for (int t = 0; t < kThreads; ++t) {
+            workers.emplace_back([&log, &exceptions, t] {
+                for (int i = 0; i < kPerThread; ++i) {
+                    try {
+                        Lsn lsn = log.AppendCommit(static_cast<TxnId>(t * kPerThread + i));
+                        log.FlushThrough(lsn);
+                    } catch (...) {
+                        exceptions.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+    };
+
+    std::exception_ptr thrown;
+    bool completed = RunBounded(work, &thrown, std::chrono::seconds(30));
+    FLINTDB_CHECK(completed);  // must not hang under real concurrent load
+    if (completed) {
+        FLINTDB_CHECK(thrown == nullptr);
+        FLINTDB_CHECK_EQ(exceptions.load(), 0);
+        FLINTDB_CHECK_EQ(log.DurableLsn(), log.NextLsn() - 1);  // every appended record ended up durable
     }
 }

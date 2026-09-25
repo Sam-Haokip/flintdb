@@ -14,3 +14,7 @@ cmake-build-*/
 .DS_Store
 .vscode/
 .idea/
+
+# Python (scripts/*.py)
+__pycache__/
+*.pyc

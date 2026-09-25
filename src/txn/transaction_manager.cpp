@@ -83,8 +83,16 @@ void TransactionManager::Commit(Transaction* txn) {
             log_manager_->AppendUpdate(txn->Id(), object_id, page_id, page->Data());
         }
     }
-    log_manager_->AppendCommit(txn->Id());
-    log_manager_->Flush();  // fsync the WAL first (write-ahead-logging rule) ...
+    Lsn commit_lsn = log_manager_->AppendCommit(txn->Id());
+    // fsync the WAL first (write-ahead-logging rule) -- via FlushThrough,
+    // not a plain Flush(), so concurrent commits coalesce into fewer
+    // fsync calls instead of each paying its own fsync latency while
+    // holding every lock this transaction still holds (Strict 2PL: all
+    // locks held until commit, including BPlusTree's root-lock sentinel,
+    // D-028) -- see docs/DECISIONS.md D-055 for the benchmark finding
+    // that motivated this and log_manager.h's FlushThrough for the full
+    // group-commit protocol.
+    log_manager_->FlushThrough(commit_lsn);
     for (const auto& [object_id, page_ids] : by_object) {
         // ... then force *this transaction's own* pages, per object, to
         // catch up (see class comment) -- FlushPages, not FlushAll, so a
